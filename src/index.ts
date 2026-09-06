@@ -1,3 +1,4 @@
+import './piloot-bridge'; // Piloot: мостик к окну-хозяину
 /* @refresh reload */
 
 // must run before any other module — under the preview flag the first swaps
