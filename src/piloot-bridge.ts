@@ -343,7 +343,21 @@ function makeDraggable() {
       .filter(Boolean)
       .flatMap((raw) => JSON.parse(raw as string));
 
-    if(payloads.length) event.dataTransfer.setData(MESSAGE_MIME, JSON.stringify(payloads));
+    if(!payloads.length) return;
+
+    event.dataTransfer.setData(MESSAGE_MIME, JSON.stringify(payloads));
+    event.dataTransfer.effectAllowed = 'copy';
+
+    /*
+     * Сколько сообщений едет — отдельным сообщением наружу: пока жест идёт,
+     * саму нагрузку браузер читать не даёт, а подпись на затемнении обязана
+     * назвать число до броска.
+     */
+    window.parent.postMessage({[MARK]: 1, event: 'drag', count: payloads.length}, '*');
+  }, true);
+
+  document.addEventListener('dragend', () => {
+    window.parent.postMessage({[MARK]: 1, event: 'drag', count: 0}, '*');
   }, true);
 }
 
