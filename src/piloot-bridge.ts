@@ -11,11 +11,48 @@
  * без него Piloot не сможет перевести их в свой формат — по одному числу
  * обычную группу от супергруппы не отличить.
  */
-import appImManager from '@lib/appImManager';
-import apiManagerProxy from '@lib/apiManagerProxy';
-import appDownloadManager from '@lib/appDownloadManager';
-import choosePhotoSize from '@appManagers/utils/photos/choosePhotoSize';
-import rootScope from '@lib/rootScope';
+/*
+ * Внутренности Web K берём ленивым импортом, а не обычным, — и это не вкус.
+ *
+ * Обычный импорт втягивал их в главный кусок сборки вместе с их стилями.
+ * Правило виртуального списка чатов (`._Item{position:absolute}`) при этом
+ * переезжало из своего куска в общий файл и оказывалось ВЫШЕ правила
+ * `.row{position:relative}` — то перебивало его, строки списка занимали
+ * место в потоке и одновременно сдвигались на свой `top`, и чаты
+ * расходились вдвое.
+ *
+ * С ленивым импортом разбиение сборки возвращается к своему: проверено —
+ * главный файл стилей выходит байт в байт как в сборке без нашего патча.
+ *
+ * Отсюда правило: **ничего из Web K не импортировать сверху этого файла.**
+ */
+type Внутренности = {
+  appImManager: any;
+  apiManagerProxy: any;
+  appDownloadManager: any;
+  choosePhotoSize: any;
+  rootScope: any;
+};
+
+let взятое: Promise<Внутренности> | undefined;
+
+function web(): Promise<Внутренности> {
+  взятое ??= Promise.all([
+    import('@lib/appImManager'),
+    import('@lib/apiManagerProxy'),
+    import('@lib/appDownloadManager'),
+    import('@appManagers/utils/photos/choosePhotoSize'),
+    import('@lib/rootScope')
+  ]).then(([im, proxy, downloads, choose, scope]) => ({
+    appImManager: im.default,
+    apiManagerProxy: proxy.default,
+    appDownloadManager: downloads.default,
+    choosePhotoSize: choose.default,
+    rootScope: scope.default
+  }));
+
+  return взятое;
+}
 
 /*
  * Номер собеседника всегда зовётся `peerId`, а не `id`: `id` занят номером
@@ -46,6 +83,7 @@ async function kindOf(peerId: PeerId): Promise<ChatKind> {
    * получить непустое обещание, а оно истинно всегда: любой чат стал бы
    * человеком, и супергруппы переводились бы в неверный номер.
    */
+  const {rootScope} = await web();
   const peers = rootScope.managers.appPeersManager;
   if(await peers.isUser(peerId)) return 'user';
 
@@ -54,6 +92,7 @@ async function kindOf(peerId: PeerId): Promise<ChatKind> {
 
 /** Имя чата или человека одной строкой. */
 async function titleOf(peerId: PeerId): Promise<string> {
+  const {rootScope} = await web();
   const peer: any = await rootScope.managers.appPeersManager.getPeer(peerId);
   if(!peer) return '';
 
@@ -102,6 +141,7 @@ function mediaOf(media: any) {
 
 /** Само вложение сообщения: фотография или документ. */
 async function fileOf(peerId: PeerId, mid: number) {
+  const {rootScope} = await web();
   const message: any = await rootScope.managers.appMessagesManager.getMessageByPeer(peerId, mid);
 
   return message?.media?.photo ?? message?.media?.document ?? null;
@@ -109,6 +149,7 @@ async function fileOf(peerId: PeerId, mid: number) {
 
 /** Сообщение в том виде, в каком его ждёт панель Piloot. */
 async function messagePayload(peerId: PeerId, mid: number) {
+  const {rootScope} = await web();
   const message: any = await rootScope.managers.appMessagesManager.getMessageByPeer(peerId, mid);
   if(!message) return null;
 
@@ -131,6 +172,7 @@ async function messagePayload(peerId: PeerId, mid: number) {
  * Piloot спрашивает отдельно и только для тех лиц, что действительно показывает.
  */
 async function membersOf(peerId: PeerId) {
+  const {rootScope} = await web();
   const result: any = await rootScope.managers.appProfileManager.getParticipants({
     id: peerId.toChatId()
   });
@@ -160,6 +202,7 @@ async function membersOf(peerId: PeerId) {
  * умирает вместе с ней, а картинка нужна панели снаружи.
  */
 async function photoOf(peerId: PeerId): Promise<string | null> {
+  const {rootScope, apiManagerProxy} = await web();
   const photo: any = await rootScope.managers.appPeersManager.getPeerPhoto(peerId);
   if(!photo) return null;
 
@@ -190,6 +233,7 @@ async function thumbOf(peerId: PeerId, mid: number, width: number): Promise<stri
   const media: any = await fileOf(peerId, mid);
   if(!media) return null;
 
+  const {choosePhotoSize, appDownloadManager} = await web();
   const size = choosePhotoSize(media, width, width, true);
   const url = await appDownloadManager.downloadMediaURL({media, thumb: size as any});
 
@@ -206,6 +250,7 @@ async function voiceOf(peerId: PeerId, mid: number): Promise<string | null> {
   const media: any = await fileOf(peerId, mid);
   if(!media) return null;
 
+  const {appDownloadManager} = await web();
   const url = await appDownloadManager.downloadMediaURL({media});
 
   return url ? asDataUrl(url) : null;
@@ -216,6 +261,8 @@ function reply(id: number, ok: unknown, error?: string) {
 }
 
 async function handle(ask: any) {
+  const {appImManager, rootScope} = await web();
+
   switch(ask.kind) {
     case 'chat': {
       const peerId = appImManager.chat?.peerId;
@@ -281,12 +328,14 @@ function listen() {
   });
 
   // Сменился чат — Piloot должен пойти за ним следом.
-  appImManager.addEventListener('peer_changed', () => {
-    const peerId = appImManager.chat?.peerId;
-    if(!peerId) return;
+  void web().then(({appImManager}) => {
+    appImManager.addEventListener('peer_changed', () => {
+      const peerId = appImManager.chat?.peerId;
+      if(!peerId) return;
 
-    void chatOf(peerId).then((chat) => {
-      window.parent.postMessage({[MARK]: 1, event: 'chat', ...chat}, '*');
+      void chatOf(peerId).then((chat) => {
+        window.parent.postMessage({[MARK]: 1, event: 'chat', ...chat}, '*');
+      });
     });
   });
 }
@@ -299,6 +348,13 @@ function listen() {
  */
 function makeDraggable() {
   /*
+   * Пока внутренности не приехали, номер открытого чата спросить не у кого.
+   * Держим их здесь: наблюдатель зовёт `mark` часто, и ждать в нём нельзя.
+   */
+  let чат: any;
+  void web().then((всё) => (чат = всё.appImManager));
+
+  /*
    * Нагрузку готовим заранее, здесь, а не в dragstart: собрать её —
    * это обещание, а dragstart обещаний не ждёт. Спохватись мы в момент
    * жеста — первый бросок ушёл бы пустым.
@@ -306,7 +362,7 @@ function makeDraggable() {
   const mark = (root: ParentNode) => {
     root.querySelectorAll?.('.bubble[data-mid]').forEach((bubble) => {
       const element = bubble as HTMLElement;
-      const peerId = appImManager.chat?.peerId;
+      const peerId = чат?.chat?.peerId;
       const mid = element.dataset.mid;
       if(!peerId || !mid) return;
 
