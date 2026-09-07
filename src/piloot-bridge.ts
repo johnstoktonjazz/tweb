@@ -13,6 +13,8 @@
  */
 import appImManager from '@lib/appImManager';
 import apiManagerProxy from '@lib/apiManagerProxy';
+import appDownloadManager from '@lib/appDownloadManager';
+import choosePhotoSize from '@appManagers/utils/photos/choosePhotoSize';
 import rootScope from '@lib/rootScope';
 
 /** Метка наших сообщений: чужие postMessage проходят мимо. */
@@ -55,6 +57,49 @@ async function chatOf(peerId: PeerId) {
   return {id: String(peerId), title: await titleOf(peerId), kind: await kindOf(peerId)};
 }
 
+/**
+ * Как вид вложения называется у Web K и как — у Piloot.
+ *
+ * Перевод нужен потому, что Piloot складывает вид вложения в файл проекта:
+ * там должны лежать наши слова, а не внутренние имена чужой библиотеки.
+ * Чего в списке нет — «документ»: показывать его всё равно нечем, кроме
+ * имени файла.
+ */
+const MEDIA_KINDS: Record<string, string> = {
+  voice: 'voice',
+  audio: 'audio',
+  round: 'video-note',
+  video: 'video',
+  sticker: 'sticker',
+  photo: 'photo',
+  gif: 'animation'
+};
+
+/** Приметы вложения: вид, имя, размер, длительность. Файла здесь нет. */
+function mediaOf(media: any) {
+  if(!media) return undefined;
+
+  if(media._ === 'messageMediaPhoto') return {kind: 'photo'};
+
+  const document = media.document;
+  if(!document) return undefined;
+
+  const приметы: any = {kind: MEDIA_KINDS[document.type] ?? 'document'};
+
+  if(document.file_name) приметы.name = document.file_name;
+  if(typeof document.size === 'number') приметы.size = document.size;
+  if(typeof document.duration === 'number') приметы.duration = document.duration;
+
+  return приметы;
+}
+
+/** Само вложение сообщения: фотография или документ. */
+async function fileOf(peerId: PeerId, mid: number) {
+  const message: any = await rootScope.managers.appMessagesManager.getMessageByPeer(peerId, mid);
+
+  return message?.media?.photo ?? message?.media?.document ?? null;
+}
+
 /** Сообщение в том виде, в каком его ждёт панель Piloot. */
 async function messagePayload(peerId: PeerId, mid: number) {
   const message: any = await rootScope.managers.appMessagesManager.getMessageByPeer(peerId, mid);
@@ -70,7 +115,7 @@ async function messagePayload(peerId: PeerId, mid: number) {
     from: {name: await titleOf(fromId), id: String(fromId)},
     date: message.date,
     // Приметы вложения, а не сам файл: правило 3 Piloot.
-    media: message.media ? {kind: message.media._} : undefined
+    media: mediaOf(message.media)
   };
 }
 
@@ -114,6 +159,16 @@ async function photoOf(peerId: PeerId): Promise<string | null> {
   const url = await apiManagerProxy.loadAvatar(peerId, photo, 'photo_small');
   if(!url) return null;
 
+  return asDataUrl(url);
+}
+
+/**
+ * Ссылка на файл → строка `data:`.
+ *
+ * Ссылка живёт в этой рамке и умирает вместе с ней, а картинку и звук
+ * панель показывает у себя — значит наружу должно уйти самодостаточное.
+ */
+async function asDataUrl(url: string): Promise<string> {
   const blob = await (await fetch(url)).blob();
 
   return new Promise<string>((resolve) => {
@@ -121,6 +176,32 @@ async function photoOf(peerId: PeerId): Promise<string | null> {
     reader.onloadend = () => resolve(reader.result as string);
     reader.readAsDataURL(blob);
   });
+}
+
+/** Превью вложения под ширину, которую просит панель. Нечего показать — пусто. */
+async function thumbOf(peerId: PeerId, mid: number, width: number): Promise<string | null> {
+  const media: any = await fileOf(peerId, mid);
+  if(!media) return null;
+
+  const size = choosePhotoSize(media, width, width, true);
+  const url = await appDownloadManager.downloadMediaURL({media, thumb: size as any});
+
+  return url ? asDataUrl(url) : null;
+}
+
+/**
+ * Голосовое целиком: играет его панель, а не Web K.
+ *
+ * Целиком, а не потоком: голосовое короткое, а плеер панели умеет только
+ * готовый файл — и это ровно то, что у неё было с TDLib.
+ */
+async function voiceOf(peerId: PeerId, mid: number): Promise<string | null> {
+  const media: any = await fileOf(peerId, mid);
+  if(!media) return null;
+
+  const url = await appDownloadManager.downloadMediaURL({media});
+
+  return url ? asDataUrl(url) : null;
 }
 
 function reply(id: number, ok: unknown, error?: string) {
@@ -145,6 +226,12 @@ async function handle(ask: any) {
 
     case 'photo':
       return photoOf(ask.id.toPeerId());
+
+    case 'thumb':
+      return thumbOf(ask.chatId.toPeerId(), Number(ask.messageId), Number(ask.width));
+
+    case 'voice':
+      return voiceOf(ask.chatId.toPeerId(), Number(ask.messageId));
 
     case 'show': {
       // Открыть чат на нужном сообщении.
