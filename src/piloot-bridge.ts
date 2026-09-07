@@ -17,6 +17,13 @@ import appDownloadManager from '@lib/appDownloadManager';
 import choosePhotoSize from '@appManagers/utils/photos/choosePhotoSize';
 import rootScope from '@lib/rootScope';
 
+/*
+ * Номер собеседника всегда зовётся `peerId`, а не `id`: `id` занят номером
+ * самого вопроса. Пока эти два поля назывались одинаково, номер собеседника
+ * затирал номер вопроса — и вопросы про человека, лицо и открытие чата
+ * молча пропадали, не дойдя до разбора.
+ */
+
 /** Метка наших сообщений: чужие postMessage проходят мимо. */
 const MARK = 'piloot';
 
@@ -222,10 +229,10 @@ async function handle(ask: any) {
       return membersOf(ask.chatId.toPeerId());
 
     case 'person':
-      return chatOf(ask.id.toPeerId());
+      return chatOf(ask.peerId.toPeerId());
 
     case 'photo':
-      return photoOf(ask.id.toPeerId());
+      return photoOf(ask.peerId.toPeerId());
 
     case 'thumb':
       return thumbOf(ask.chatId.toPeerId(), Number(ask.messageId), Number(ask.width));
@@ -244,7 +251,7 @@ async function handle(ask: any) {
 
     case 'openChat': {
       // Заменяет наш прежний экран профиля: разговор открывает Telegram.
-      await appImManager.setPeer({peerId: ask.id.toPeerId()});
+      await appImManager.setPeer({peerId: ask.peerId.toPeerId()});
       return true;
     }
 
