@@ -29,6 +29,7 @@
 type Внутренности = {
   appImManager: any;
   apiManagerProxy: any;
+  themeController: any;
   appDownloadManager: any;
   choosePhotoSize: any;
   rootScope: any;
@@ -42,13 +43,15 @@ function web(): Promise<Внутренности> {
     import('@lib/apiManagerProxy'),
     import('@lib/appDownloadManager'),
     import('@appManagers/utils/photos/choosePhotoSize'),
-    import('@lib/rootScope')
-  ]).then(([im, proxy, downloads, choose, scope]) => ({
+    import('@lib/rootScope'),
+    import('@helpers/themeController')
+  ]).then(([im, proxy, downloads, choose, scope, theme]) => ({
     appImManager: im.default,
     apiManagerProxy: proxy.default,
     appDownloadManager: downloads.default,
     choosePhotoSize: choose.default,
-    rootScope: scope.default
+    rootScope: scope.default,
+    themeController: theme.default
   }));
 
   return взятое;
@@ -256,6 +259,48 @@ async function voiceOf(peerId: PeerId, mid: number): Promise<string | null> {
   return url ? asDataUrl(url) : null;
 }
 
+/** Цвет из числа Telegram в привычную запись. */
+function hex(color: number | undefined): string | undefined {
+  return color === undefined ? undefined : '#' + color.toString(16).padStart(6, '0');
+}
+
+/**
+ * Обои переписки: чем Telegram красит фон под пузырями.
+ *
+ * Отдаём не картинку, а рецепт — цвета градиента, узор и его силу. Рисует
+ * по нему панель Piloot у себя: холст Web K живёт в его окне и шире рамки
+ * не бывает, а фон нужен под всем нашим окном.
+ */
+async function wallpaperOf() {
+  const {themeController} = await web();
+  const theme = themeController.getTheme();
+  const settings: any = themeController.getThemeSettings(theme);
+  const wallpaper: any = settings?.wallpaper;
+  const пятна: any = wallpaper?.settings;
+
+  if(!пятна) return null;
+
+  const colors = [
+    пятна.background_color,
+    пятна.second_background_color,
+    пятна.third_background_color,
+    пятна.fourth_background_color
+  ].map(hex).filter(Boolean);
+
+  return {
+    colors,
+    /*
+     * Сила узора у Telegram со знаком: у тёмных обоев она отрицательная и
+     * значит другой способ наложения. Отдаём как есть — пусть решает тот,
+     * кто рисует.
+     */
+    intensity: пятна.intensity ?? 0,
+    // Узор встроенного фона лежит файлом в его же раздаче.
+    pattern: wallpaper?.pFlags?.pattern ? 'assets/img/pattern.svg' : null,
+    dark: !!wallpaper?.pFlags?.dark
+  };
+}
+
 function reply(id: number, ok: unknown, error?: string) {
   window.parent.postMessage({[MARK]: 1, replyTo: id, ok, error}, '*');
 }
@@ -302,6 +347,9 @@ async function handle(ask: any) {
       return true;
     }
 
+    case 'wallpaper':
+      return wallpaperOf();
+
     case 'invoke':
       /*
        * Дверь ко всему Telegram API. Через неё пойдут расшифровка голосового,
@@ -325,6 +373,22 @@ function listen() {
       (ok) => reply(ask.id, ok),
       (error) => reply(ask.id, null, String(error?.type ?? error?.message ?? error))
     );
+  });
+
+  /*
+   * Сменилась тема или обои — Piloot перекрашивается следом. Шлём сами, не
+   * дожидаясь вопроса: перерисовать фон надо в тот же миг, а не при
+   * следующем обращении.
+   */
+  void web().then(({rootScope}) => {
+    const рассказать = () => {
+      void wallpaperOf().then((wallpaper) => {
+        window.parent.postMessage({[MARK]: 1, event: 'wallpaper', wallpaper}, '*');
+      });
+    };
+
+    rootScope.addEventListener('theme_changed', рассказать);
+    rootScope.addEventListener('background_changed', рассказать);
   });
 
   // Сменился чат — Piloot должен пойти за ним следом.
