@@ -304,16 +304,30 @@ function makeDraggable() {
    * жеста — первый бросок ушёл бы пустым.
    */
   const mark = (root: ParentNode) => {
-    root.querySelectorAll?.('.bubble[data-mid]:not([draggable])').forEach((bubble) => {
+    root.querySelectorAll?.('.bubble[data-mid]').forEach((bubble) => {
       const element = bubble as HTMLElement;
-      element.setAttribute('draggable', 'true');
-
       const peerId = appImManager.chat?.peerId;
-      const mid = Number(element.dataset.mid);
+      const mid = element.dataset.mid;
       if(!peerId || !mid) return;
 
-      void messagePayload(peerId, mid).then((payload) => {
-        if(payload) element.dataset.pilootPayload = JSON.stringify([payload]);
+      /*
+       * Уже собрана и на тот же номер — второй раз не собираем. Сравнение
+       * именно с номером, а не «есть ли нагрузка»: Web K выдаёт
+       * отправляемому сообщению временный номер (822363.0001) и заменяет
+       * его настоящим, когда сервер ответит. Собранная однажды нагрузка
+       * после этого указывает в никуда, а её округление — на соседнее
+       * сообщение. Так тикет однажды и сослался на чужой текст.
+       */
+      const готовая = element.dataset.pilootPayload;
+      if(готовая && готовая.indexOf('"messageId":"' + mid + '"') !== -1) return;
+
+      element.setAttribute('draggable', 'true');
+
+      void messagePayload(peerId, Number(mid)).then((payload) => {
+        // Пока нагрузка собиралась, номер мог смениться снова.
+        if(payload && element.dataset.mid === mid) {
+          element.dataset.pilootPayload = JSON.stringify([payload]);
+        }
       });
     });
   };
@@ -321,11 +335,22 @@ function makeDraggable() {
   mark(document);
   new MutationObserver((records) => {
     for(const record of records) {
+      if(record.type === 'attributes') {
+        if(record.target instanceof HTMLElement) mark(record.target.parentNode ?? document);
+        continue;
+      }
+
       record.addedNodes.forEach((node) => {
         if(node instanceof HTMLElement) mark(node);
       });
     }
-  }).observe(document.body, {childList: true, subtree: true});
+  }).observe(document.body, {
+    childList: true,
+    subtree: true,
+    // Номер сообщения меняется прямо на месте, без пересоздания пузыря.
+    attributes: true,
+    attributeFilter: ['data-mid']
+  });
 
   document.addEventListener('dragstart', (event) => {
     const bubble = (event.target as HTMLElement)?.closest?.('.bubble[data-mid]');
