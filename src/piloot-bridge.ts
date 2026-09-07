@@ -2,12 +2,17 @@
  * Мостик Piloot ↔ Telegram Web K.
  *
  * Единственное, что Piloot дописывает в Web K. Внутри ничего не меняет:
- * только отвечает на вопросы окна-хозяина и выполняет одну команду.
+ * отвечает на вопросы окна-хозяина и выполняет его команды.
  *
  * Разговор идёт через postMessage и только с родительским окном. Открытый
  * сам по себе, Web K не заметит, что этот файл есть.
+ *
+ * Номера отдаём как есть, в виде Web K, но всегда с видом собеседника:
+ * без него Piloot не сможет перевести их в свой формат — по одному числу
+ * обычную группу от супергруппы не отличить.
  */
 import appImManager from '@lib/appImManager';
+import apiManagerProxy from '@lib/apiManagerProxy';
 import rootScope from '@lib/rootScope';
 
 /** Метка наших сообщений: чужие postMessage проходят мимо. */
@@ -19,23 +24,23 @@ const MESSAGE_MIME = 'application/x-piloot-message';
 /** Web K живёт сам по себе — мостик не нужен. */
 const framed = window.parent !== window;
 
-/**
- * Момент времени как «2026-09-04T12:40:17+03:00».
- * Тот же вид, что у Piloot: у сообщения важна минута, а без пояса
- * минута читается по-разному в разных местах.
- */
-function isoWithZone(seconds: number): string {
-  const date = new Date(seconds * 1000);
-  const pad = (value: number) => String(value).padStart(2, '0');
-  const offset = -date.getTimezoneOffset();
-  const sign = offset < 0 ? '-' : '+';
-  const away = Math.abs(offset);
+type ChatKind = 'user' | 'group' | 'channel';
 
-  return (
-    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
-    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}` +
-    `${sign}${pad(Math.floor(away / 60))}:${pad(away % 60)}`
-  );
+/**
+ * Кто по ту сторону. «Канал» здесь — и канал, и супергруппа: Web K их
+ * не разделяет, и TDLib кодировал их одинаково. Piloot полагается на это.
+ */
+async function kindOf(peerId: PeerId): Promise<ChatKind> {
+  /*
+   * Менеджеры Web K живут в рабочем потоке, и обращение к ним — обещание,
+   * даже когда метод выглядит мгновенным. Забыть про await здесь значило бы
+   * получить непустое обещание, а оно истинно всегда: любой чат стал бы
+   * человеком, и супергруппы переводились бы в неверный номер.
+   */
+  const peers = rootScope.managers.appPeersManager;
+  if(await peers.isUser(peerId)) return 'user';
+
+  return (await peers.isChannel(peerId)) ? 'channel' : 'group';
 }
 
 /** Имя чата или человека одной строкой. */
@@ -46,28 +51,32 @@ async function titleOf(peerId: PeerId): Promise<string> {
   return peer.title || [peer.first_name, peer.last_name].filter(Boolean).join(' ');
 }
 
+async function chatOf(peerId: PeerId) {
+  return {id: String(peerId), title: await titleOf(peerId), kind: await kindOf(peerId)};
+}
+
 /** Сообщение в том виде, в каком его ждёт панель Piloot. */
 async function messagePayload(peerId: PeerId, mid: number) {
   const message: any = await rootScope.managers.appMessagesManager.getMessageByPeer(peerId, mid);
   if(!message) return null;
 
+  const fromId = message.fromId ?? peerId;
+
   return {
     chatId: String(peerId),
     messageId: String(mid),
+    kind: await kindOf(peerId),
     text: message.message || '',
-    from: {name: await titleOf(message.fromId ?? peerId), id: String(message.fromId ?? peerId)},
-    date: isoWithZone(message.date),
+    from: {name: await titleOf(fromId), id: String(fromId)},
+    date: message.date,
     // Приметы вложения, а не сам файл: правило 3 Piloot.
     media: message.media ? {kind: message.media._} : undefined
   };
 }
 
 /**
- * Участники чата. Аватарку отдаём приметой (есть или нет), а не картинкой:
- * тащить байты через postMessage ради списка людей незачем.
- *
- * `getParticipants` сам разбирает, супергруппа это или обычный чат, — через
- * `getChatFull` список у супергрупп приходит пустым.
+ * Участники чата. Аватарку отдаём приметой «есть или нет»: сами картинки
+ * Piloot спрашивает отдельно и только для тех лиц, что действительно показывает.
  */
 async function membersOf(peerId: PeerId) {
   const result: any = await rootScope.managers.appProfileManager.getParticipants({
@@ -92,6 +101,28 @@ async function membersOf(peerId: PeerId) {
   };
 }
 
+/**
+ * Аватарка картинкой — по требованию и как самодостаточная строка.
+ *
+ * Именно строкой, а не ссылкой на объект: ссылка живёт в этой рамке и
+ * умирает вместе с ней, а картинка нужна панели снаружи.
+ */
+async function photoOf(peerId: PeerId): Promise<string | null> {
+  const photo: any = await rootScope.managers.appPeersManager.getPeerPhoto(peerId);
+  if(!photo) return null;
+
+  const url = await apiManagerProxy.loadAvatar(peerId, photo, 'photo_small');
+  if(!url) return null;
+
+  const blob = await (await fetch(url)).blob();
+
+  return new Promise<string>((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result as string);
+    reader.readAsDataURL(blob);
+  });
+}
+
 function reply(id: number, ok: unknown, error?: string) {
   window.parent.postMessage({[MARK]: 1, replyTo: id, ok, error}, '*');
 }
@@ -100,7 +131,7 @@ async function handle(ask: any) {
   switch(ask.kind) {
     case 'chat': {
       const peerId = appImManager.chat?.peerId;
-      return peerId ? {id: String(peerId), title: await titleOf(peerId)} : null;
+      return peerId ? chatOf(peerId) : null;
     }
 
     case 'message':
@@ -109,14 +140,33 @@ async function handle(ask: any) {
     case 'members':
       return membersOf(ask.chatId.toPeerId());
 
+    case 'person':
+      return chatOf(ask.id.toPeerId());
+
+    case 'photo':
+      return photoOf(ask.id.toPeerId());
+
     case 'show': {
-      // Единственная команда внутрь: открыть чат на сообщении.
+      // Открыть чат на нужном сообщении.
       await appImManager.setInnerPeer({
         peerId: ask.chatId.toPeerId(),
         lastMsgId: Number(ask.messageId)
       });
       return true;
     }
+
+    case 'openChat': {
+      // Заменяет наш прежний экран профиля: разговор открывает Telegram.
+      await appImManager.setPeer({peerId: ask.id.toPeerId()});
+      return true;
+    }
+
+    case 'invoke':
+      /*
+       * Дверь ко всему Telegram API. Через неё пойдут расшифровка голосового,
+       * ИИ-тон и напоминания — без новой правки Web K на каждый случай.
+       */
+      return rootScope.managers.apiManager.invokeApi(ask.method, ask.params ?? {});
 
     default:
       throw new Error('неизвестный вопрос: ' + ask.kind);
@@ -132,7 +182,7 @@ function listen() {
 
     handle(ask).then(
       (ok) => reply(ask.id, ok),
-      (error) => reply(ask.id, null, String(error?.message ?? error))
+      (error) => reply(ask.id, null, String(error?.type ?? error?.message ?? error))
     );
   });
 
@@ -141,8 +191,8 @@ function listen() {
     const peerId = appImManager.chat?.peerId;
     if(!peerId) return;
 
-    void titleOf(peerId).then((title) => {
-      window.parent.postMessage({[MARK]: 1, event: 'chat', id: String(peerId), title}, '*');
+    void chatOf(peerId).then((chat) => {
+      window.parent.postMessage({[MARK]: 1, event: 'chat', ...chat}, '*');
     });
   });
 }
@@ -185,11 +235,21 @@ function makeDraggable() {
 
   document.addEventListener('dragstart', (event) => {
     const bubble = (event.target as HTMLElement)?.closest?.('.bubble[data-mid]');
-    const peerId = appImManager.chat?.peerId;
-    if(!bubble || !peerId || !event.dataTransfer) return;
+    if(!bubble || !event.dataTransfer) return;
 
-    const ready = (bubble as HTMLElement).dataset.pilootPayload;
-    if(ready) event.dataTransfer.setData(MESSAGE_MIME, ready);
+    /*
+     * Пачку собираем из выделенного штатными средствами Web K. Выделения
+     * нет — уходит один пузырь, тот, за который взялись.
+     */
+    const picked = [...document.querySelectorAll('.bubble.is-selected[data-piloot-payload]')];
+    const source = picked.length > 1 ? picked : [bubble];
+
+    const payloads = source
+      .map((element) => (element as HTMLElement).dataset.pilootPayload)
+      .filter(Boolean)
+      .flatMap((raw) => JSON.parse(raw as string));
+
+    if(payloads.length) event.dataTransfer.setData(MESSAGE_MIME, JSON.stringify(payloads));
   }, true);
 }
 

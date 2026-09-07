@@ -951,6 +951,7 @@ export class AppSidebarLeft extends SidebarSlider {
     }, {
       icon: 'help',
       text: 'TelegramFeatures',
+      verify: () => false, // Piloot: чужой сайт в нашем окне не нужен
       onClick: () => {
         const url = I18n.format('TelegramFeaturesUrl', true);
         appImManager.openUrl(url);
@@ -959,6 +960,7 @@ export class AppSidebarLeft extends SidebarSlider {
     }, {
       icon: 'bug',
       text: 'ReportBug',
+      verify: () => false, // Piloot: чужой сайт в нашем окне не нужен
       onClick: () => {
         const a = document.createElement('a');
         setBlankToAnchor(a);
