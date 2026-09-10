@@ -33,6 +33,8 @@ type Внутренности = {
   appDownloadManager: any;
   choosePhotoSize: any;
   rootScope: any;
+  appChatBackground: any;
+  patternRenderer: any;
 };
 
 let взятое: Promise<Внутренности> | undefined;
@@ -44,14 +46,18 @@ function web(): Promise<Внутренности> {
     import('@lib/appDownloadManager'),
     import('@appManagers/utils/photos/choosePhotoSize'),
     import('@lib/rootScope'),
-    import('@helpers/themeController')
-  ]).then(([im, proxy, downloads, choose, scope, theme]) => ({
+    import('@helpers/themeController'),
+    import('@components/chat/bubbles/chatBackground'),
+    import('@components/chat/patternRenderer')
+  ]).then(([im, proxy, downloads, choose, scope, theme, background, pattern]) => ({
     appImManager: im.default,
     apiManagerProxy: proxy.default,
     appDownloadManager: downloads.default,
     choosePhotoSize: choose.default,
     rootScope: scope.default,
-    themeController: theme.default
+    themeController: theme.default,
+    appChatBackground: background.default,
+    patternRenderer: pattern.default
   }));
 
   return взятое;
@@ -259,46 +265,168 @@ async function voiceOf(peerId: PeerId, mid: number): Promise<string | null> {
   return url ? asDataUrl(url) : null;
 }
 
-/** Цвет из числа Telegram в привычную запись. */
-function hex(color: number | undefined): string | undefined {
-  return color === undefined ? undefined : '#' + color.toString(16).padStart(6, '0');
+/*
+ * ── Обои ──────────────────────────────────────────────────────────────
+ *
+ * Раньше мы отдавали Piloot «рецепт» — цвета, узор, силу — и он рисовал по
+ * нему свои обои. Рецепт расходился с настоящими: градиент Telegram считает
+ * своей формулой на холсте 50×50 и растягивает, а не кладёт пятна по углам;
+ * плитка узора у него считается от высоты окна, а не берётся из файла.
+ * На стыке рамки и панели это давало шов.
+ *
+ * Поэтому теперь мы не пересказываем его фон, а **показываем его же**:
+ *  · градиент Piloot получает живым зеркалом (см. `зеркалоГрадиента`);
+ *  · всё остальное снимаем с его собственных слоёв — коробки, прозрачности,
+ *    способ наложения. Ни одного числа отсюда мы не придумываем.
+ */
+
+/** Коробка элемента: где стоит и какого размера, в точках окна Telegram. */
+function коробка(el: Element) {
+  const {left, top, width, height} = el.getBoundingClientRect();
+
+  return {left, top, width, height};
 }
 
 /**
- * Обои переписки: чем Telegram красит фон под пузырями.
+ * Видимый слой фона.
  *
- * Отдаём не картинку, а рецепт — цвета градиента, узор и его силу. Рисует
- * по нему панель Piloot у себя: холст Web K живёт в его окне и шире рамки
- * не бывает, а фон нужен под всем нашим окном.
+ * Слоёв у него всегда два: один на экране, второй собирается про запас и
+ * ждёт своей очереди. Различаются прозрачностью — берём тот, что виден.
+ */
+function живойСлой(корень: HTMLElement): HTMLElement | null {
+  let лучший: HTMLElement | null = null;
+  let сила = 0;
+
+  for(const холст of Array.from(корень.querySelectorAll('canvas, img'))) {
+    const слой = холст.parentElement;
+    if(!слой) continue;
+
+    const своя = Number(getComputedStyle(слой).opacity);
+    if(своя > сила) {
+      сила = своя;
+      лучший = слой;
+    }
+  }
+
+  return сила > 0.5 ? лучший : null;
+}
+
+/**
+ * Настройки узора у самого Web K.
+ *
+ * Адрес картинки узора он держит только внутри своего рисовальщика — ни в
+ * разметке, ни в стилях его нет. Находим рисовальщика по холсту, который он
+ * заполнил: холст мы уже держим в руках, и совпадение получается точным.
+ */
+function узорХолста(patternRenderer: any, холст: HTMLCanvasElement): any {
+  const все = patternRenderer?.INSTANCES;
+  if(!Array.isArray(все)) return null;
+
+  return все.find((один: any) => один?.canvases?.has?.(холст))?.options ?? null;
+}
+
+/**
+ * Обои переписки: как Telegram нарисовал фон прямо сейчас.
+ *
+ * Отдаём не рецепт, а снятые с его слоёв числа. Градиент здесь только
+ * коробкой и прозрачностью — сама картинка приходит зеркалом, отдельно.
  */
 async function wallpaperOf() {
-  const {themeController} = await web();
-  const theme = themeController.getTheme();
-  const settings: any = themeController.getThemeSettings(theme);
-  const wallpaper: any = settings?.wallpaper;
-  const пятна: any = wallpaper?.settings;
+  const {appChatBackground, patternRenderer} = await web();
+  const корень: HTMLElement | undefined = appChatBackground?.element;
+  if(!корень) return null;
 
-  if(!пятна) return null;
+  const слой = живойСлой(корень);
+  if(!слой) return null;
 
-  const colors = [
-    пятна.background_color,
-    пятна.second_background_color,
-    пятна.third_background_color,
-    пятна.fourth_background_color
-  ].map(hex).filter(Boolean);
+  let градиент: any = null;
+  let узор: any = null;
+  let картинка: any = null;
+
+  for(const дитя of Array.from(слой.children)) {
+    const вид = getComputedStyle(дитя);
+    const прозрачность = Number(вид.opacity);
+
+    if(дитя instanceof HTMLCanvasElement) {
+      /*
+       * Два холста, и различить их проще всего по размеру: градиент он
+       * считает на крошечном (50×50) и растягивает, узор рисует во всё окно.
+       */
+      if(дитя.width <= 200) {
+        градиент = {...коробка(дитя), opacity: прозрачность};
+        continue;
+      }
+
+      const свои = узорХолста(patternRenderer, дитя);
+      if(!свои?.url) continue;
+
+      узор = {
+        ...коробка(дитя),
+        url: свои.url,
+        opacity: прозрачность,
+        blend: вид.mixBlendMode,
+        invert: вид.filter !== 'none',
+        /*
+         * Тёмный узор он рисует наоборот: холст заливается чёрным, а сам
+         * рисунок вырезается из него дырками. Дальше цвет виден только
+         * сквозь дырки.
+         */
+        mask: !!свои.mask,
+        /*
+         * Высота плитки. Единственное число Web K, которое мы повторяем, а
+         * не снимаем: переменной для него нет, оно живёт формулой в
+         * webk/src/components/chat/patternRenderer.ts, в `fillCanvas`.
+         */
+        tileHeight: 500 + window.innerHeight / 2.5
+      };
+
+      continue;
+    }
+
+    if(дитя instanceof HTMLImageElement) {
+      картинка = {...коробка(дитя), url: дитя.src, opacity: прозрачность};
+    }
+  }
 
   return {
-    colors,
-    /*
-     * Сила узора у Telegram со знаком: у тёмных обоев она отрицательная и
-     * значит другой способ наложения. Отдаём как есть — пусть решает тот,
-     * кто рисует.
-     */
-    intensity: пятна.intensity ?? 0,
-    // Узор встроенного фона лежит файлом в его же раздаче.
-    pattern: wallpaper?.pFlags?.pattern ? 'assets/img/pattern.svg' : null,
-    dark: !!wallpaper?.pFlags?.dark
+    gradient: градиент,
+    pattern: узор,
+    picture: картинка,
+    /* Фон под слоями: у тёмных обоев он чёрный и виден между рисунком. */
+    background: getComputedStyle(слой).backgroundColor
   };
+}
+
+/**
+ * Живое зеркало градиента.
+ *
+ * У Web K это штатная возможность: он сам ею красит полосу папок слева.
+ * Даёшь ему свой холст — и он перерисовывает его каждый раз, когда
+ * перерисовывает свой. Значит, у Piloot не копия градиента, а он сам.
+ *
+ * Холсты приходят из окна Piloot — оно того же происхождения, и рисовать в
+ * них Web K может напрямую. Сменил тему или обои — заводится новый
+ * рисовальщик, и зеркало перецепляется само.
+ */
+function зеркалоГрадиента(холсты: HTMLCanvasElement[]): Promise<() => void> {
+  return web().then(({appChatBackground}) => {
+    let отцепить: (() => void)[] = [];
+
+    const перецепить = (рисовальщик: any) => {
+      for(const снять of отцепить) снять();
+      отцепить = [];
+
+      if(!рисовальщик) return;
+      for(const холст of холсты) отцепить.push(рисовальщик.attachMirror(холст));
+    };
+
+    const отписка = appChatBackground.onActiveGradientRendererChange(перецепить);
+
+    return () => {
+      отписка();
+      перецепить(null);
+    };
+  });
 }
 
 function reply(id: number, ok: unknown, error?: string) {
@@ -507,6 +635,13 @@ function makeDraggable() {
 }
 
 if(framed) {
+  /*
+   * Зеркало передаём не сообщением, а прямым вызовом: холст через
+   * postMessage не проходит, а окна у нас одного происхождения — Piloot
+   * достаёт до этой функции так же, как он уже читает наши переменные темы.
+   */
+  (window as any).pilootBackground = {mirror: зеркалоГрадиента};
+
   listen();
   makeDraggable();
 }
