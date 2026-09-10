@@ -475,6 +475,16 @@ async function handle(ask: any) {
       return true;
     }
 
+    case 'closeChat': {
+      /*
+       * Закрыть чат — «все проекты» справа. Зовём ровно то же, что зовёт
+       * сам Web K, когда снимает чат со стопки навигации по Esc или по
+       * стрелке назад в узком окне (appImManager.ts, onPop у пункта 'im').
+       */
+      await appImManager.setPeer({});
+      return true;
+    }
+
     case 'wallpaper':
       return wallpaperOf();
 
@@ -519,11 +529,21 @@ function listen() {
     rootScope.addEventListener('background_changed', рассказать);
   });
 
-  // Сменился чат — Piloot должен пойти за ним следом.
+  /*
+   * Сменился чат — Piloot должен пойти за ним следом.
+   *
+   * И закрылся тоже: раньше про закрытие мы молчали, и панель никогда не
+   * узнавала, что слева стало пусто. А пусто слева — это «все проекты»
+   * справа, и без этой вести до них не добраться.
+   */
   void web().then(({appImManager}) => {
     appImManager.addEventListener('peer_changed', () => {
       const peerId = appImManager.chat?.peerId;
-      if(!peerId) return;
+
+      if(!peerId) {
+        window.parent.postMessage({[MARK]: 1, event: 'chat', chatId: null}, '*');
+        return;
+      }
 
       void chatOf(peerId).then((chat) => {
         window.parent.postMessage({[MARK]: 1, event: 'chat', ...chat}, '*');
