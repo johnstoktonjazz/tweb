@@ -35,6 +35,7 @@ type Внутренности = {
   rootScope: any;
   appChatBackground: any;
   patternRenderer: any;
+  ChatContextMenu: any;
 };
 
 let взятое: Promise<Внутренности> | undefined;
@@ -48,8 +49,9 @@ function web(): Promise<Внутренности> {
     import('@lib/rootScope'),
     import('@helpers/themeController'),
     import('@components/chat/bubbles/chatBackground'),
-    import('@components/chat/patternRenderer')
-  ]).then(([im, proxy, downloads, choose, scope, theme, background, pattern]) => ({
+    import('@components/chat/patternRenderer'),
+    import('@components/chat/contextMenu')
+  ]).then(([im, proxy, downloads, choose, scope, theme, background, pattern, menu]) => ({
     appImManager: im.default,
     apiManagerProxy: proxy.default,
     appDownloadManager: downloads.default,
@@ -57,7 +59,8 @@ function web(): Promise<Внутренности> {
     rootScope: scope.default,
     themeController: theme.default,
     appChatBackground: background.default,
-    patternRenderer: pattern.default
+    patternRenderer: pattern.default,
+    ChatContextMenu: menu.default
   }));
 
   return взятое;
@@ -552,6 +555,115 @@ function listen() {
   });
 }
 
+/** Пузырь, которому принадлежит узел: текст внутри пузыря — тоже его. */
+function пузырьОт(node: Node | null): HTMLElement | null {
+  const element = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node as HTMLElement | null;
+  return (element?.closest?.('.bubble[data-mid]') as HTMLElement | null) ?? null;
+}
+
+/**
+ * Выделенный текст в переписке и пузыри, которые он задевает.
+ *
+ * Пусто, если выделения нет или оно лежит вне пузырей — например, в
+ * поле ввода.
+ */
+function выделенное(): {bubbles: HTMLElement[], text: string} | null {
+  const selection = window.getSelection();
+  if(!selection || selection.isCollapsed || !selection.rangeCount) return null;
+
+  const range = selection.getRangeAt(0);
+  const bubbles = ([...document.querySelectorAll('.bubble[data-mid]')] as HTMLElement[])
+    .filter((bubble) => range.intersectsNode(bubble));
+  const text = selection.toString().trim();
+
+  return bubbles.length && text ? {bubbles, text} : null;
+}
+
+/** Готовые нагрузки пузырей: собраны заранее, в `mark`. */
+function нагрузкиИз(bubbles: HTMLElement[]): any[] {
+  return bubbles
+  .map((element) => element.dataset.pilootPayload)
+  .filter(Boolean)
+  .flatMap((raw) => JSON.parse(raw as string));
+}
+
+/**
+ * Пункт «Сделать тикет» в меню сообщения (153).
+ *
+ * Файлы Web K мы не правим, поэтому пункт добавляет мостик: подменяет у
+ * меню метод, который отбирает пункты перед показом, и дописывает свой.
+ * Цена известна и принята владельцем: переименуй Web K этот метод при
+ * обновлении — пункт пропадёт. Web K обновляем руками по номеру коммита,
+ * поэтому узнаем сразу; мостик скажет об этом в консоль.
+ */
+function addTicketItem() {
+  void web().then(({ChatContextMenu}) => {
+    const прототип = ChatContextMenu?.prototype;
+    const отбор = прототип?.filterButtons;
+
+    if(typeof отбор !== 'function') {
+      console.warn('[piloot] меню сообщения устроено иначе — пункт «Сделать тикет» не добавлен');
+      return;
+    }
+
+    прототип.filterButtons = function(this: any, buttons: any[]): Promise<any[]> {
+      if(!buttons.some((button) => button?.pilootTicket)) {
+        const слова = (window.parent as any).pilootForWebk?.words;
+        const пункт = {
+          pilootTicket: true,
+          icon: 'plusround',
+          regularText: слова?.makeTicket ?? 'Сделать тикет',
+          withSelection: true,
+          onClick: (): void => {
+            void сделатьТикет(this);
+          },
+          verify: (): boolean => this.message?._ === 'message' && !this.isSponsored
+        };
+        // Рядом с «Копировать»: то же семейство — взять сообщение с собой.
+        const место = buttons.findIndex((button) => button?.text === 'Copy');
+        buttons.splice(место === -1 ? 0 : место, 0, пункт);
+      }
+
+      return отбор.call(this, buttons);
+    };
+  });
+}
+
+/**
+ * Что уходит в тикет из меню.
+ *
+ * Выбраны сообщения штатным выделением Web K — они все, по порядку.
+ * Выделен текст в одном сообщении — это сообщение с куском. Текст задевает
+ * несколько — они целиком. Иначе — то сообщение, по которому открыли меню.
+ */
+async function сделатьТикет(menu: any) {
+  const peerId = menu.messagePeerId ?? menu.peerId;
+  const выбранные: number[] = menu.chat?.selection?.isSelecting ?
+    [...(menu.chat.selection.selectedMids?.get?.(peerId) ?? [])] :
+    [];
+
+  let payloads: any[];
+
+  if(выбранные.length) {
+    payloads = await Promise.all(выбранные.sort((a, b) => a - b).map((mid) => messagePayload(peerId, mid)));
+  } else {
+    const выбор = menu.isTextSelected ? выделенное() : null;
+    const пузыри = выбор?.bubbles ?? [];
+
+    if(пузыри.length > 1) {
+      payloads = await Promise.all(пузыри.map((bubble) => messagePayload(bubble.dataset.peerId?.toPeerId?.() ?? peerId, Number(bubble.dataset.mid))));
+    } else if(пузыри.length === 1) {
+      const payload = await messagePayload(пузыри[0].dataset.peerId?.toPeerId?.() ?? peerId, Number(пузыри[0].dataset.mid));
+      payloads = [payload && {...payload, quote: выбор.text}];
+    } else {
+      payloads = [await messagePayload(peerId, menu.mid)];
+    }
+  }
+
+  payloads = payloads.filter(Boolean);
+  if(payloads.length) window.parent.postMessage({[MARK]: 1, event: 'ticket', payloads}, '*');
+}
+
 /**
  * Пузырь становится перетаскиваемым и несёт нашу нагрузку.
  *
@@ -621,20 +733,35 @@ function makeDraggable() {
   });
 
   document.addEventListener('dragstart', (event) => {
-    const bubble = (event.target as HTMLElement)?.closest?.('.bubble[data-mid]');
+    const target = event.target as Node;
+    const bubble = пузырьОт(target);
     if(!bubble || !event.dataTransfer) return;
 
     /*
-     * Пачку собираем из выделенного штатными средствами Web K. Выделения
-     * нет — уходит один пузырь, тот, за который взялись.
+     * Тащат выделенный текст, а не пузырь (153). Браузер начинает такое
+     * перетаскивание сам, без задержки, и цель у него — текст, а не
+     * пузырь. Кусок одного сообщения едет куском; выделение через два и
+     * больше — целыми сообщениями (решение владельца при плане 153).
      */
-    const picked = [...document.querySelectorAll('.bubble.is-selected[data-piloot-payload]')];
-    const source = picked.length > 1 ? picked : [bubble];
+    const выбор = выделенное();
+    const тащатВыделение = выбор !== null &&
+      target !== bubble &&
+      window.getSelection().getRangeAt(0).intersectsNode(target);
 
-    const payloads = source
-      .map((element) => (element as HTMLElement).dataset.pilootPayload)
-      .filter(Boolean)
-      .flatMap((raw) => JSON.parse(raw as string));
+    let payloads: any[];
+
+    if(тащатВыделение) {
+      payloads = выбор.bubbles.length === 1 ?
+        нагрузкиИз([выбор.bubbles[0]]).map((payload): any => ({...payload, quote: выбор.text})) :
+        нагрузкиИз(выбор.bubbles);
+    } else {
+      /*
+       * Пачку собираем из выделенного штатными средствами Web K. Выделения
+       * нет — уходит один пузырь, тот, за который взялись.
+       */
+      const picked = [...document.querySelectorAll('.bubble.is-selected[data-piloot-payload]')] as HTMLElement[];
+      payloads = нагрузкиИз(picked.length > 1 ? picked : [bubble]);
+    }
 
     if(!payloads.length) return;
 
@@ -664,4 +791,5 @@ if(framed) {
 
   listen();
   makeDraggable();
+  addTicketItem();
 }
