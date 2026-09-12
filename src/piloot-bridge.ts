@@ -665,6 +665,87 @@ async function сделатьТикет(menu: any) {
 }
 
 /**
+ * Бросок — только после задержки (153).
+ *
+ * Перетаскивание и выделение висят на одном движении, поэтому пузырь можно
+ * тащить, только подержав указатель на месте. Двинул раньше — Chromium зовёт
+ * dragstart, мы его отменяем, и дальше идёт обычное выделение текста.
+ * Подержал — пузырь «взят»: получает отметку, слой стилей Piloot его
+ * приподнимает, и dragstart пропускаем.
+ *
+ * Порог дрожи — самого Chromium (вариант «а» владельца): отменённый
+ * dragstart хоронит перетаскивание до отпускания кнопки, и погасить мелкое
+ * движение раньше него нельзя — замерено в 153. Задержку и правило даёт
+ * панель (`src/shared/hold.ts` Piloot): там их проверки и там их подбирают.
+ */
+type Нажатие = {bubble: HTMLElement, t0: number, x0: number, y0: number, сдвиг: number, итог: string, таймер: number};
+
+let нажатие: Нажатие | null = null;
+
+/** Правило задержки от панели. Нет его — Web K открыт не в Piloot, ворот нет. */
+function правилоЗадержки(): any {
+  return (window.parent as any).pilootForWebk?.hold;
+}
+
+/** Нажатие кончилось: отметку «взят» снимаем, ожидание гасим. */
+function отпустить() {
+  if(!нажатие) return;
+
+  clearTimeout(нажатие.таймер);
+  нажатие.bubble.removeAttribute('data-piloot-lifted');
+  нажатие = null;
+}
+
+/** Нажали ли внутри уже выделенного текста: тогда это вторая дверь. */
+function внутриВыделения(x: number, y: number): boolean {
+  if(!выделенное()) return false;
+
+  const каретка = document.caretRangeFromPoint?.(x, y);
+  return !!каретка && window.getSelection().getRangeAt(0).isPointInRange(каретка.startContainer, каретка.startOffset);
+}
+
+function holdToThrow() {
+  document.addEventListener('pointerdown', (event) => {
+    отпустить();
+    if(event.button !== 0 || event.pointerType === 'touch') return;
+
+    const bubble = пузырьОт(event.target as Node);
+    const правило = правилоЗадержки();
+    if(!bubble || !правило) return;
+
+    // Внутри выделения браузер тащит выделенное сам — задержка не нужна.
+    if(внутриВыделения(event.clientX, event.clientY)) return;
+
+    const своё: Нажатие = {bubble, t0: performance.now(), x0: event.clientX, y0: event.clientY, сдвиг: 0, итог: 'wait', таймер: 0};
+
+    своё.таймер = window.setTimeout(() => {
+      if(нажатие !== своё || своё.итог !== 'wait') return;
+
+      своё.итог = правило.verdict(performance.now() - своё.t0, своё.сдвиг);
+      if(своё.итог === 'lift') своё.bubble.setAttribute('data-piloot-lifted', '');
+    }, правило.delayMs);
+
+    нажатие = своё;
+  }, true);
+
+  document.addEventListener('pointermove', (event) => {
+    if(!нажатие || нажатие.итог !== 'wait') return;
+
+    const правило = правилоЗадержки();
+    const сдвиг = правило?.shift(event.clientX - нажатие.x0, event.clientY - нажатие.y0, window.devicePixelRatio) ?? 0;
+    нажатие.сдвиг = Math.max(нажатие.сдвиг, сдвиг);
+  }, true);
+
+  /*
+   * Снимаем по отпусканию и по концу перетаскивания. По pointercancel — нет:
+   * Chromium шлёт его, когда перетаскивание уже началось, и отметка «взят»
+   * нужна воротам до самого dragstart.
+   */
+  document.addEventListener('pointerup', отпустить, true);
+  document.addEventListener('dragend', отпустить, true);
+}
+
+/**
  * Пузырь становится перетаскиваемым и несёт нашу нагрузку.
  *
  * Атрибут ставим наблюдателем: пузыри рождаются и умирают по мере
@@ -748,6 +829,19 @@ function makeDraggable() {
       target !== bubble &&
       window.getSelection().getRangeAt(0).intersectsNode(target);
 
+    /*
+     * Ворота задержки (153): пузырь, который не подержали, не тащится —
+     * отменяем, и Chromium ведёт выделение текста дальше.
+     */
+    if(!тащатВыделение && правилоЗадержки() && нажатие?.итог !== 'lift') {
+      event.preventDefault();
+      if(нажатие) {
+        clearTimeout(нажатие.таймер);
+        нажатие.итог = 'select';
+      }
+      return;
+    }
+
     let payloads: any[];
 
     if(тащатВыделение) {
@@ -791,5 +885,6 @@ if(framed) {
 
   listen();
   makeDraggable();
+  holdToThrow();
   addTicketItem();
 }
