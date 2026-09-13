@@ -82,6 +82,79 @@ const MESSAGE_MIME = 'application/x-piloot-message';
 /** Web K живёт сам по себе — мостик не нужен. */
 const framed = window.parent !== window;
 
+/*
+ * Вошёл ли человек в Telegram (Piloot, задача 156).
+ *
+ * Пока не вошёл, мостик внутренностей Web K не трогает вовсе. Взять их у
+ * невошедшего значило запустить части Telegram, рассчитанные на
+ * вошедшего: они шлют запрос с незарегистрированным ключом, сервер
+ * отвечает AUTH_KEY_UNREGISTERED, Web K перезагружает себя — и так по
+ * кругу, раз в 3,5–5 с (замер 156). Войти было нельзя.
+ *
+ * О входе узнаём по вести самого Web K — `user_auth` на его `rootScope`.
+ * Этот узел Web K грузит сам ещё до экрана входа (`src/index.ts` берёт
+ * его сверху), поэтому, взяв его, мостик ничего нового не запускает.
+ * Вошедшему весть приходит при чтении состояния; чтобы не пропустить её,
+ * смотрим ещё и уже известный номер `myId`.
+ *
+ * После входа по QR страница не перезагружается — чаты появляются тут же.
+ * Поэтому вход замечаем на ходу, а не только при загрузке.
+ */
+let вошёл = false;
+
+const входПроизошёл: Promise<void> = new Promise((готово) => {
+  if(!framed) return;
+
+  void import('@lib/rootScope').then(({default: rootScope}) => {
+    const отметить = (): void => {
+      if(вошёл) return;
+
+      вошёл = true;
+      готово();
+      посмотретьВид();
+    };
+
+    rootScope.addEventListener('user_auth', отметить);
+    if(rootScope.myId) отметить();
+  });
+});
+
+/*
+ * Что слева на экране — форма входа или чаты (156). Панель проектов у
+ * невошедшего не показывается вовсе и появляется ровно тогда, когда
+ * слева появились чаты: не раньше, иначе форма входа сузилась бы на
+ * глазах, пока её ещё видно.
+ *
+ * Чаты на экране — когда Web K снял с `body` класс `has-auth-pages`
+ * (`bootstrapIm`) и человек вошёл. Форма входа — когда Web K вставил в
+ * `body` корень `#auth-flow-root` (`mountAuthFlow`). И класс, и узел ставит
+ * сам Web K; мостик только смотрит.
+ */
+type ВидСлева = 'вход' | 'чаты' | null;
+
+let видСлева: ВидСлева = null;
+
+function посмотретьВид(): void {
+  const чаты = вошёл && !document.body.classList.contains('has-auth-pages');
+  const вход = !чаты && document.getElementById('auth-flow-root') !== null;
+  const стало: ВидСлева = чаты ? 'чаты' : вход ? 'вход' : null;
+
+  if(стало === null || стало === видСлева) return;
+
+  видСлева = стало;
+  window.parent.postMessage({[MARK]: 1, event: 'auth', signedIn: стало === 'чаты'}, '*');
+}
+
+function следитьЗаВидом(): void {
+  new MutationObserver(посмотретьВид).observe(document.body, {
+    attributes: true,
+    attributeFilter: ['class'],
+    childList: true
+  });
+
+  посмотретьВид();
+}
+
 type ChatKind = 'user' | 'group' | 'channel';
 
 /**
@@ -412,6 +485,9 @@ async function wallpaperOf() {
  * рисовальщик, и зеркало перецепляется само.
  */
 function зеркалоГрадиента(холсты: HTMLCanvasElement[]): Promise<() => void> {
+  /* До входа внутренностей не трогаем (156): отцеплять нечего. */
+  if(!вошёл) return Promise.resolve((): void => {});
+
   return web().then(({appChatBackground}) => {
     let отцепить: (() => void)[] = [];
 
@@ -510,16 +586,41 @@ function listen() {
     const ask = event.data;
     if(!ask || ask[MARK] !== 1 || typeof ask.id !== 'number') return;
 
+    /* Что слева на экране — отвечаем всегда, внутренности тут не нужны. */
+    if(ask.kind === 'auth') {
+      reply(ask.id, видСлева === null ? null : видСлева === 'чаты');
+      return;
+    }
+
+    /*
+     * Спросили до входа — «не вошли», ничего не запуская (156). Любой
+     * ответ по существу потянул бы внутренности Web K, а с ними и цикл
+     * перезагрузок.
+     */
+    if(!вошёл) {
+      reply(ask.id, null, 'не вошли');
+      return;
+    }
+
     handle(ask).then(
       (ok) => reply(ask.id, ok),
       (error) => reply(ask.id, null, String(error?.type ?? error?.message ?? error))
     );
   });
+}
 
+/*
+ * Тема и смена чата — только после входа (156): оба слушателя живут на
+ * внутренностях Web K.
+ */
+function следитьЗаТемойИЧатом() {
   /*
    * Сменилась тема или обои — Piloot перекрашивается следом. Шлём сами, не
    * дожидаясь вопроса: перерисовать фон надо в тот же миг, а не при
    * следующем обращении.
+   *
+   * И один раз сразу после входа: до входа панель спрашивала вид и
+   * получала «не вошли», а перекраситься ей нужно уже сейчас.
    */
   void web().then(({rootScope}) => {
     const рассказать = () => {
@@ -530,6 +631,7 @@ function listen() {
 
     rootScope.addEventListener('theme_changed', рассказать);
     rootScope.addEventListener('background_changed', рассказать);
+    рассказать();
   });
 
   /*
@@ -901,7 +1003,16 @@ if(framed) {
   (window as any).pilootBackground = {mirror: зеркалоГрадиента};
 
   listen();
-  makeDraggable();
-  holdToThrow();
-  addTicketItem();
+  следитьЗаВидом();
+
+  /*
+   * Всё, что трогает внутренности Web K, — только после входа (156): тема,
+   * смена чата, перетаскивание, задержка броска, пункт меню сообщения.
+   */
+  void входПроизошёл.then(() => {
+    следитьЗаТемойИЧатом();
+    makeDraggable();
+    holdToThrow();
+    addTicketItem();
+  });
 }
