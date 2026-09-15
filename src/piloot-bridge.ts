@@ -184,8 +184,29 @@ async function titleOf(peerId: PeerId): Promise<string> {
   return peer.title || [peer.first_name, peer.last_name].filter(Boolean).join(' ');
 }
 
+/**
+ * Чат для панели: номер, название, вид. У человека ещё имя — как Telegram
+ * его показывает — и признак бота (Piloot 160): по ним панель подписывает
+ * пилюлю собеседника и не заводит её боту. Всё из той же памяти Web K,
+ * что и название, — лишнего похода в Telegram нет.
+ */
 async function chatOf(peerId: PeerId) {
-  return {id: String(peerId), title: await titleOf(peerId), kind: await kindOf(peerId)};
+  const kind = await kindOf(peerId);
+  const чат: {id: string, title: string, kind: ChatKind, firstName?: string, bot?: boolean} = {
+    id: String(peerId),
+    title: await titleOf(peerId),
+    kind
+  };
+
+  if(kind === 'user') {
+    const {rootScope} = await web();
+    const человек: any = await rootScope.managers.appPeersManager.getPeer(peerId);
+
+    чат.firstName = человек?.first_name ?? '';
+    if(человек?.pFlags?.bot) чат.bot = true;
+  }
+
+  return чат;
 }
 
 /**
