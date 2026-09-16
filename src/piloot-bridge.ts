@@ -36,6 +36,10 @@ type Внутренности = {
   appChatBackground: any;
   patternRenderer: any;
   ChatContextMenu: any;
+  SetTransition: any;
+  fastRaf: any;
+  getVisibleRect: any;
+  cancelContextMenuOpening: any;
 };
 
 let взятое: Promise<Внутренности> | undefined;
@@ -50,8 +54,12 @@ function web(): Promise<Внутренности> {
     import('@helpers/themeController'),
     import('@components/chat/bubbles/chatBackground'),
     import('@components/chat/patternRenderer'),
-    import('@components/chat/contextMenu')
-  ]).then(([im, proxy, downloads, choose, scope, theme, background, pattern, menu]) => ({
+    import('@components/chat/contextMenu'),
+    import('@components/singleTransition'),
+    import('@helpers/schedulers'),
+    import('@helpers/dom/getVisibleRect'),
+    import('@helpers/dom/attachContextMenuListener')
+  ]).then(([im, proxy, downloads, choose, scope, theme, background, pattern, menu, transition, schedulers, visible, contextMenu]) => ({
     appImManager: im.default,
     apiManagerProxy: proxy.default,
     appDownloadManager: downloads.default,
@@ -60,7 +68,11 @@ function web(): Promise<Внутренности> {
     themeController: theme.default,
     appChatBackground: background.default,
     patternRenderer: pattern.default,
-    ChatContextMenu: menu.default
+    ChatContextMenu: menu.default,
+    SetTransition: transition.default,
+    fastRaf: schedulers.fastRaf,
+    getVisibleRect: visible.default,
+    cancelContextMenuOpening: contextMenu.cancelContextMenuOpening
   }));
 
   return взятое;
@@ -711,7 +723,7 @@ function нагрузкиИз(bubbles: HTMLElement[]): any[] {
 }
 
 /**
- * Пункт «Сделать тикет» в меню сообщения (153).
+ * Пункт «Send to Piloot» в меню сообщения (153; до 164 — «Сделать тикет»).
  *
  * Файлы Web K мы не правим, поэтому пункт добавляет мостик: подменяет у
  * меню метод, который отбирает пункты перед показом, и дописывает свой.
@@ -735,7 +747,7 @@ function addTicketItem() {
         const пункт = {
           pilootTicket: true,
           icon: 'plusround',
-          regularText: слова?.makeTicket ?? 'Сделать тикет',
+          regularText: слова?.makeTicket ?? 'Send to Piloot',
           withSelection: true,
           onClick: (): void => {
             void сделатьТикет(this);
@@ -1015,6 +1027,194 @@ function makeDraggable() {
   }, true);
 }
 
+/**
+ * Свайп сообщения вправо — в панель (Piloot 164).
+ *
+ * Зеркало свайпа «Ответить» самого Web K (`attachReplyWheelSwipe` и
+ * `createReplySwipeController` в `components/chat/bubbles.ts`): у него
+ * пальцы по трекпаду влево открывают ответ, у нас пальцы вправо — в
+ * сторону панели — кладут сообщение туда же, куда пункт «Send to Piloot».
+ *
+ * Трекпад шлёт жест событиями прокрутки. Слушаем их на документе, раньше
+ * слушателя Web K на ленте: жест вправо над подходящим пузырём забираем
+ * целиком, и до Web K он не доходит; любой другой жест пропускаем
+ * нетронутым — ответ влево и прокрутка работают как прежде. Направление,
+ * порог и конец жеста считает правило панели (`src/shared/swipe.ts`
+ * Piloot), здесь — только разметка и движение.
+ *
+ * Движение — его же средствами и числами: тот же класс перехода, тот же
+ * помощник на 250 мс, сдвиг строкой стиля, вместе с аватаркой группы.
+ * Значка внутрь пузыря не вставляем (правило 12 Piloot): пузырь получает
+ * атрибуты `data-piloot-swipe` и `data-piloot-swipe-hiding`, значок рисует
+ * слой стилей Piloot.
+ *
+ * Проверку «в чат можно писать» у Web K не повторяем: тикет делается и из
+ * канала, как пунктом меню (решение владельца при плане 164).
+ */
+function правилоСвайпа(): any {
+  return (window.parent as any).pilootForWebk?.swipe;
+}
+
+function swipeToPanel() {
+  const КЛАСС = 'is-gesturing-reply';
+
+  let вн: Внутренности | undefined;
+  void web().then((всё) => (вн = всё));
+
+  let состояние: any = null;
+  let тишина = 0;
+  let пузырь: HTMLElement | undefined;
+  let аватар: HTMLElement | undefined;
+  let начато = false;
+  let сдвиг = 0;
+
+  /** Вложенный блок (код, широкая таблица) ещё может уехать влево сам — жест его. */
+  const внутриЕдетВлево = (from: HTMLElement, до: HTMLElement): boolean => {
+    for(let element = from; element && element !== до; element = element.parentElement) {
+      if(element.scrollWidth > element.clientWidth && element.scrollLeft > 0) {
+        const overflowX = getComputedStyle(element).overflowX;
+        if(overflowX === 'auto' || overflowX === 'scroll') return true;
+      }
+    }
+
+    return false;
+  };
+
+  /** Годится ли пузырь под пальцами. Разметку не трогаем: касание без движения следа не оставляет. */
+  const найти = (target: HTMLElement): boolean => {
+    const chat = вн?.appImManager?.chat;
+    if(!chat || !вн) return false;
+    if(chat.type === 'pinned' || chat.type === 'logs' || chat.selection?.isSelecting) return false;
+
+    const bubble = target.closest?.('.bubble[data-mid]') as HTMLElement | null;
+    const лента = bubble?.closest('.bubbles') as HTMLElement | null;
+    if(!bubble || !лента) return false;
+    if(['service', 'is-sending', 'is-sponsored', 'is-date'].some((name) => bubble.classList.contains(name))) return false;
+    if(внутриЕдетВлево(target, лента)) return false;
+
+    пузырь = bubble;
+    аватар = undefined;
+    начато = false;
+    сдвиг = 0;
+
+    try {
+      const свой = bubble.parentElement?.querySelector('.bubbles-group-avatar') as HTMLElement | null;
+      if(свой && вн.getVisibleRect(свой, bubble)) аватар = свой;
+    } catch(err) {}
+
+    return true;
+  };
+
+  const двигать = (offset: number, правило: any) => {
+    if(!пузырь || !вн) return;
+
+    if(!начато) {
+      начато = true;
+      for(const element of [пузырь, аватар].filter(Boolean)) {
+        вн.SetTransition({element, className: КЛАСС, forwards: true, duration: 250});
+        void element.offsetLeft;
+      }
+    }
+
+    сдвиг = offset;
+    /* Как у него: дошёл до порога — значок виден до конца жеста, даже если пальцы вернулись. */
+    const виден = пузырь.getAttribute('data-piloot-swipe') === 'ready' || правило.commits(offset);
+    пузырь.removeAttribute('data-piloot-swipe-hiding');
+    пузырь.setAttribute('data-piloot-swipe', виден ? 'ready' : 'on');
+    пузырь.style.setProperty('--piloot-swipe-opacity', String(правило.iconOpacity(offset)));
+
+    const transform = `translateX(${offset}px)`;
+    пузырь.style.transform = transform;
+    if(аватар) аватар.style.transform = transform;
+    вн.cancelContextMenuOpening();
+  };
+
+  const закончить = (правило: any) => {
+    const bubble = пузырь;
+    const свой = аватар;
+    const итог = начато && правило.commits(сдвиг);
+
+    пузырь = аватар = undefined;
+    if(!bubble || !начато || !вн) return;
+    начато = false;
+
+    /* Значок гаснет, пока пузырь едет назад, а не пропадает одним кадром. */
+    bubble.setAttribute('data-piloot-swipe-hiding', '');
+
+    [bubble, свой].filter(Boolean).forEach((element, номер) => {
+      вн.SetTransition({
+        element,
+        className: КЛАСС,
+        forwards: false,
+        duration: 250,
+        onTransitionEnd: номер === 0 ? () => {
+          if(!bubble.hasAttribute('data-piloot-swipe-hiding')) return;
+          bubble.removeAttribute('data-piloot-swipe');
+          bubble.removeAttribute('data-piloot-swipe-hiding');
+          bubble.style.removeProperty('--piloot-swipe-opacity');
+        } : undefined
+      });
+    });
+
+    вн.fastRaf(() => {
+      bubble.style.transform = '';
+      if(свой) свой.style.transform = '';
+    });
+
+    if(!итог) return;
+
+    const peerId = bubble.dataset.peerId?.toPeerId?.() ?? вн.appImManager.chat?.peerId;
+    const mid = Number(bubble.dataset.mid);
+    if(!peerId || !mid) return;
+
+    void вн.rootScope.managers.appMessagesManager.getMessageByPeer(peerId, mid).then((message: any) => {
+      /* Как у пункта меню: только настоящее сообщение. */
+      if(message?._ !== 'message') return;
+
+      return messagePayload(peerId, mid).then((payload) => {
+        if(payload) window.parent.postMessage({[MARK]: 1, event: 'ticket', payloads: [payload]}, '*');
+      });
+    });
+  };
+
+  const тихо = (правило: any) => {
+    clearTimeout(тишина);
+    тишина = window.setTimeout(() => {
+      закончить(правило);
+      состояние = null;
+    }, правило.idleMs);
+  };
+
+  document.addEventListener('wheel', (event: WheelEvent) => {
+    const правило = правилоСвайпа();
+    if(!правило) return;
+
+    состояние ??= правило.start();
+
+    const шаг = правило.step(состояние, {
+      dx: правило.pixels(event.deltaX, event.deltaMode, document.documentElement.clientWidth),
+      dy: event.deltaY,
+      modifier: event.ctrlKey || event.metaKey || event.shiftKey
+    }, () => найти(event.target as HTMLElement));
+
+    состояние = шаг.state;
+
+    if(шаг.action === 'ignore') return;
+
+    тихо(правило);
+    if(шаг.action === 'pass') return;
+
+    /* Жест наш: ни прокрутке, ни ответу Web K он не достаётся. */
+    event.preventDefault();
+    event.stopPropagation();
+
+    if(шаг.action === 'swallow') return;
+
+    двигать(состояние.offset, правило);
+    if(шаг.action === 'release') закончить(правило);
+  }, {passive: false, capture: true});
+}
+
 if(framed) {
   /*
    * Зеркало передаём не сообщением, а прямым вызовом: холст через
@@ -1028,12 +1228,14 @@ if(framed) {
 
   /*
    * Всё, что трогает внутренности Web K, — только после входа (156): тема,
-   * смена чата, перетаскивание, задержка броска, пункт меню сообщения.
+   * смена чата, перетаскивание, задержка броска, пункт меню сообщения,
+   * свайп вправо (164).
    */
   void входПроизошёл.then(() => {
     следитьЗаТемойИЧатом();
     makeDraggable();
     holdToThrow();
     addTicketItem();
+    swipeToPanel();
   });
 }
