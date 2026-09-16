@@ -40,6 +40,8 @@ type Внутренности = {
   fastRaf: any;
   getVisibleRect: any;
   cancelContextMenuOpening: any;
+  placeCaretAtEnd: any;
+  isInputEmpty: any;
 };
 
 let взятое: Promise<Внутренности> | undefined;
@@ -58,8 +60,10 @@ function web(): Promise<Внутренности> {
     import('@components/singleTransition'),
     import('@helpers/schedulers'),
     import('@helpers/dom/getVisibleRect'),
-    import('@helpers/dom/attachContextMenuListener')
-  ]).then(([im, proxy, downloads, choose, scope, theme, background, pattern, menu, transition, schedulers, visible, contextMenu]) => ({
+    import('@helpers/dom/attachContextMenuListener'),
+    import('@helpers/dom/placeCaretAtEnd'),
+    import('@helpers/dom/isInputEmpty')
+  ]).then(([im, proxy, downloads, choose, scope, theme, background, pattern, menu, transition, schedulers, visible, contextMenu, caret, empty]) => ({
     appImManager: im.default,
     apiManagerProxy: proxy.default,
     appDownloadManager: downloads.default,
@@ -72,7 +76,9 @@ function web(): Promise<Внутренности> {
     SetTransition: transition.default,
     fastRaf: schedulers.fastRaf,
     getVisibleRect: visible.default,
-    cancelContextMenuOpening: contextMenu.cancelContextMenuOpening
+    cancelContextMenuOpening: contextMenu.cancelContextMenuOpening,
+    placeCaretAtEnd: caret.default,
+    isInputEmpty: empty.default
   }));
 
   return взятое;
@@ -204,7 +210,7 @@ async function titleOf(peerId: PeerId): Promise<string> {
  */
 async function chatOf(peerId: PeerId) {
   const kind = await kindOf(peerId);
-  const чат: {id: string, title: string, kind: ChatKind, firstName?: string, bot?: boolean} = {
+  const чат: {id: string, title: string, kind: ChatKind, firstName?: string, bot?: boolean, username?: string} = {
     id: String(peerId),
     title: await titleOf(peerId),
     kind
@@ -216,6 +222,9 @@ async function chatOf(peerId: PeerId) {
 
     чат.firstName = человек?.first_name ?? '';
     if(человек?.pFlags?.bot) чат.bot = true;
+    /* Username — для упоминания в тексте тикета (Piloot 167). */
+    const ник = человек?.username ?? человек?.usernames?.find((one: any) => one?.pFlags?.active)?.username;
+    if(ник) чат.username = ник;
   }
 
   return чат;
@@ -599,6 +608,12 @@ async function handle(ask: any) {
 
     case 'wallpaper':
       return wallpaperOf();
+
+    case 'insertText':
+      return вставитьТекст(String(ask.text ?? ''));
+
+    case 'canWrite':
+      return можноПисать();
 
     case 'invoke':
       /*
@@ -1274,6 +1289,137 @@ function swipeToPanel() {
   }, {passive: false, capture: true});
 }
 
+/*
+ * ── Тикет обратно в чат (Piloot 167) ────────────────────────────────────
+ *
+ * Панель просит вставить текст тикета в поле ввода открытого чата. Мостик
+ * ставит его к набранному — с новой строки, набранное не стирается — и
+ * оставляет курсор в поле. Сам ничего не отправляет: «Отправить» нажимает
+ * человек (правило 2 Piloot).
+ *
+ * Средства — самого поля Web K: «можно ли писать» (`canSendPlain`), курсор
+ * в конец (`placeCaretAtEnd`) и вставка в место курсора (`insertAtCaret` без
+ * подсказок). Замена значения целиком (`setInputValue`) потеряла бы
+ * форматирование набранного.
+ *
+ * После вставки мостик следит за этим чатом и говорит панели одно из двух:
+ * «отправлено» — с отправленным сообщением, как у броска, — или «поле
+ * опустело без отправки». Отправка сама очищает поле раньше, чем сервер
+ * ответит, поэтому пустое поле ждёт полсекунды: пришла весть Web K
+ * «добавлено в историю» от меня в этот чат — это отправка.
+ */
+type Слежка = {peerId: any, отправляется: boolean, таймер: number};
+
+let слежка: Слежка | null = null;
+
+async function можноПисать(): Promise<boolean> {
+  const {appImManager} = await web();
+  const chat = appImManager.chat;
+
+  return !!chat?.peerId && !!chat.input?.messageInput && chat.input.canSendPlain() === true;
+}
+
+async function вставитьТекст(text: string): Promise<boolean> {
+  const вн = await web();
+  const chat = вн.appImManager.chat;
+
+  if(!text || !(await можноПисать())) return false;
+
+  const input = chat.input;
+  const поле: HTMLElement = input.messageInput;
+  const пусто = вн.isInputEmpty(поле);
+  /* Правило — у панели: набранное не стирается, тикет — с новой строки. */
+  const приставка: string = (window.parent as any).pilootForWebk?.toChat?.prefix?.(пусто) ?? (пусто ? '' : '\n');
+
+  вн.placeCaretAtEnd(поле);
+  input.insertAtCaret(приставка + text, undefined, false);
+  вн.placeCaretAtEnd(поле);
+  поле.focus();
+
+  if(слежка) clearTimeout(слежка.таймер);
+  слежка = {peerId: chat.peerId, отправляется: false, таймер: 0};
+
+  return true;
+}
+
+function следитьЗаОтправкой() {
+  void web().then((вн) => {
+    const {rootScope, appImManager} = вн;
+
+    /* Нажали «Отправить»: сообщение от меня легло в историю этого чата. */
+    rootScope.addEventListener('history_append', ({message}: any) => {
+      if(!слежка || !message?.pFlags?.out || message.peerId !== слежка.peerId) return;
+      слежка.отправляется = true;
+    });
+
+    /* Сервер принял: настоящий номер — и сообщение уходит в источники. */
+    rootScope.addEventListener('message_sent', ({message, mid}: any) => {
+      const своя = слежка;
+      const peerId = message?.peerId;
+      if(!своя || peerId !== своя.peerId) return;
+
+      clearTimeout(своя.таймер);
+      слежка = null;
+
+      void messagePayload(peerId, mid ?? message.mid).then((payload) => {
+        if(payload) window.parent.postMessage({[MARK]: 1, event: 'ticketSent', payload}, '*');
+      });
+    });
+
+    /* Поле опустело — ждём полсекунды: не отправка ли это. */
+    document.addEventListener('input', (event) => {
+      const своя = слежка;
+      const поле = appImManager.chat?.input?.messageInput;
+      if(!своя || !поле || event.target !== поле) return;
+      if(appImManager.chat.peerId !== своя.peerId || !вн.isInputEmpty(поле)) return;
+
+      clearTimeout(своя.таймер);
+      своя.таймер = window.setTimeout(() => {
+        if(слежка !== своя || своя.отправляется) return;
+        слежка = null;
+        void kindOf(своя.peerId).then((kind) => {
+          window.parent.postMessage({[MARK]: 1, event: 'ticketCleared', chatId: String(своя.peerId), kind}, '*');
+        });
+      }, 500);
+    }, true);
+  });
+}
+
+/*
+ * Бросок строки тикета на переписку (Piloot 167). Тип данных свой: Web K
+ * отзывается только на файлы и наш бросок пропускает. Чат не открыт или
+ * писать нельзя — бросок не принимается. Отпустили — панель узнаёт, какой
+ * тикет, и сама просит вставить текст.
+ */
+const TICKET_MIME = 'application/x-piloot-ticket';
+
+function принятьТикеты() {
+  let можно = false;
+
+  const наш = (event: DragEvent): boolean => !!event.dataTransfer?.types.includes(TICKET_MIME);
+
+  document.addEventListener('dragenter', (event) => {
+    if(!наш(event)) return;
+    void можноПисать().then((ответ) => (можно = ответ));
+  }, true);
+
+  document.addEventListener('dragover', (event) => {
+    if(!наш(event) || !можно) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  }, true);
+
+  document.addEventListener('drop', (event) => {
+    if(!наш(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if(!можно) return;
+
+    const key = event.dataTransfer.getData(TICKET_MIME);
+    if(key) window.parent.postMessage({[MARK]: 1, event: 'ticketDropped', key}, '*');
+  }, true);
+}
+
 if(framed) {
   /*
    * Зеркало передаём не сообщением, а прямым вызовом: холст через
@@ -1288,7 +1434,7 @@ if(framed) {
   /*
    * Всё, что трогает внутренности Web K, — только после входа (156): тема,
    * смена чата, перетаскивание, задержка броска, пункт меню сообщения,
-   * свайп вправо (164).
+   * свайп вправо (164), тикет обратно в чат (167).
    */
   void входПроизошёл.then(() => {
     следитьЗаТемойИЧатом();
@@ -1296,5 +1442,7 @@ if(framed) {
     holdToThrow();
     addTicketItem();
     swipeToPanel();
+    следитьЗаОтправкой();
+    принятьТикеты();
   });
 }
