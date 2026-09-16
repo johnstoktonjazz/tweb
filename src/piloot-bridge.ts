@@ -322,6 +322,81 @@ async function membersOf(peerId: PeerId) {
   };
 }
 
+/*
+ * Реакции сообщений одного чата (Piloot 166) — только чтение.
+ *
+ * Сообщения берём прямым запросом по номерам, тем же, каким Web K
+ * догружает одиночные сообщения: чат не открывается, в память Web K ничего
+ * не ложится, прочитанным ничего не отмечается. Кто поставил — из
+ * короткого списка внутри сообщения; если реакций на нём больше, чем в
+ * коротком, — из полного списка.
+ *
+ * `listed` — видно ли, кто поставил. В личном чате видно всегда, хотя
+ * Telegram и снимает там флаг (живая разведка 166); у групп и каналов —
+ * по флагу. Сообщения нет — `gone`.
+ */
+const СООБЩЕНИЙ_ЗА_РАЗ = 100;
+const СТРАНИЦ_СПИСКА = 5;
+
+async function reactionsOf(peerId: PeerId, ids: number[]) {
+  const {rootScope} = await web();
+  const m = rootScope.managers;
+  const личный = await m.appPeersManager.isUser(peerId);
+  const канал = !личный && await m.appPeersManager.isChannel(peerId);
+  const номера = ids.slice(0, СООБЩЕНИЙ_ЗА_РАЗ).map((id) => ({_: 'inputMessageID', id}));
+  const ответ: any = канал ?
+    await m.apiManager.invokeApi('channels.getMessages', {
+      channel: await m.appChatsManager.getChannelInput(peerId.toChatId()),
+      id: номера
+    } as any) :
+    await m.apiManager.invokeApi('messages.getMessages', {id: номера} as any);
+  const пришли = new Map<number, any>();
+  for(const message of ответ?.messages ?? []) {
+    if(message?._ === 'message') пришли.set(message.id, message);
+  }
+
+  const вход = await m.appPeersManager.getInputPeerById(peerId);
+  const итог = [];
+
+  for(const id of ids.slice(0, СООБЩЕНИЙ_ЗА_РАЗ)) {
+    const message = пришли.get(id);
+    if(!message) {
+      итог.push({id, gone: true, listed: true, reactions: [] as any[]});
+      continue;
+    }
+
+    const изПамяти = реакцииИзПамяти(message, личный);
+    if(изПамяти) {
+      итог.push({id, ...изПамяти});
+      continue;
+    }
+
+    const список: any[] = [];
+    let offset: string | undefined;
+    for(let страница = 0; страница < СТРАНИЦ_СПИСКА; ++страница) {
+      const часть: any = await m.apiManager.invokeApi('messages.getMessageReactionsList', {
+        peer: вход,
+        id,
+        limit: 100,
+        ...(offset ? {offset} : {})
+      } as any);
+      список.push(...(часть?.reactions ?? []).filter((one: any) => one?.reaction?._ === 'reactionEmoji'));
+      offset = часть?.next_offset;
+      if(!offset) break;
+    }
+
+    итог.push({
+      id,
+      listed: true,
+      reactions: список
+      .filter((one: any) => one?.peer_id?._ === 'peerUser')
+      .map((one: any) => ({userId: String(one.peer_id.user_id), emoji: String(one.reaction.emoticon), date: Number(one.date) || 0}))
+    });
+  }
+
+  return итог;
+}
+
 /**
  * Аватарка картинкой — по требованию и как самодостаточная строка.
  *
@@ -571,6 +646,9 @@ async function handle(ask: any) {
 
     case 'person':
       return chatOf(ask.peerId.toPeerId());
+
+    case 'reactions':
+      return reactionsOf(String(ask.chatId).toPeerId(), (ask.ids ?? []).map(Number).filter(Number.isInteger));
 
     case 'photo':
       return photoOf(ask.peerId.toPeerId());
@@ -1420,6 +1498,53 @@ function принятьТикеты() {
   }, true);
 }
 
+/*
+ * Web K узнал, что у сообщений поменялись реакции (Piloot 166): личные
+ * чаты, малые группы, открытый чат (его Web K сам опрашивает каждые 10 с).
+ * Панели — номера, вид чата и, если короткий список внутри сообщения
+ * полон, сами реакции: тогда панели не нужно спрашивать Telegram ещё раз.
+ * Чьи это источники и что делать, решает она.
+ */
+function реакцииИзПамяти(message: any, личный: boolean) {
+  const реакции = message?.reactions;
+  const listed = личный || !!реакции?.pFlags?.can_see_list;
+  if(!реакции) return {listed, reactions: [] as any[]};
+  if(!listed) return {listed, reactions: [] as any[]};
+
+  const эмодзи = (реакции.results ?? [])
+  .filter((one: any) => one?.reaction?._ === 'reactionEmoji')
+  .reduce((сумма: number, one: any) => сумма + (one.count ?? 0), 0);
+  const список = (реакции.recent_reactions ?? []).filter((one: any) => one?.reaction?._ === 'reactionEmoji');
+  if(список.length < эмодзи) return undefined;
+
+  return {
+    listed,
+    reactions: список
+    .filter((one: any) => one?.peer_id?._ === 'peerUser')
+    .map((one: any) => ({userId: String(one.peer_id.user_id), emoji: String(one.reaction.emoticon), date: Number(one.date) || 0}))
+  };
+}
+
+function следитьЗаРеакциями() {
+  void web().then(({rootScope}) => {
+    rootScope.addEventListener('messages_reactions', (items: any[]) => {
+      void Promise.all((items ?? []).map(async({message}: any) => {
+        if(!message?.peerId || !Number.isInteger(message.mid)) return null;
+        const kind = await kindOf(message.peerId);
+        return {
+          chatId: String(message.peerId),
+          messageId: String(message.mid),
+          kind,
+          seen: реакцииИзПамяти(message, kind === 'user')
+        };
+      })).then((найдено) => {
+        const сообщения = найдено.filter(Boolean);
+        if(сообщения.length) window.parent.postMessage({[MARK]: 1, event: 'reactions', messages: сообщения}, '*');
+      });
+    });
+  });
+}
+
 if(framed) {
   /*
    * Зеркало передаём не сообщением, а прямым вызовом: холст через
@@ -1434,7 +1559,7 @@ if(framed) {
   /*
    * Всё, что трогает внутренности Web K, — только после входа (156): тема,
    * смена чата, перетаскивание, задержка броска, пункт меню сообщения,
-   * свайп вправо (164), тикет обратно в чат (167).
+   * свайп вправо (164), тикет обратно в чат (167), реакции (166).
    */
   void входПроизошёл.then(() => {
     следитьЗаТемойИЧатом();
@@ -1444,5 +1569,6 @@ if(framed) {
     swipeToPanel();
     следитьЗаОтправкой();
     принятьТикеты();
+    следитьЗаРеакциями();
   });
 }
