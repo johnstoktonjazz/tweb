@@ -1050,6 +1050,9 @@ function makeDraggable() {
  *
  * Проверку «в чат можно писать» у Web K не повторяем: тикет делается и из
  * канала, как пунктом меню (решение владельца при плане 164).
+ *
+ * В режиме выделения (168) свайп по выделенному уносит все выделенные
+ * разом и снимает выделение; по невыделенному его нет.
  */
 function правилоСвайпа(): any {
   return (window.parent as any).pilootForWebk?.swipe;
@@ -1067,6 +1070,8 @@ function swipeToPanel() {
   let аватар: HTMLElement | undefined;
   let начато = false;
   let сдвиг = 0;
+  /** Жест начат в режиме выделения: отпускание уносит все выделенные (168). */
+  let пачкой = false;
 
   /** Вложенный блок (код, широкая таблица) ещё может уехать влево сам — жест его. */
   const внутриЕдетВлево = (from: HTMLElement, до: HTMLElement): boolean => {
@@ -1084,7 +1089,7 @@ function swipeToPanel() {
   const найти = (target: HTMLElement): boolean => {
     const chat = вн?.appImManager?.chat;
     if(!chat || !вн) return false;
-    if(chat.type === 'pinned' || chat.type === 'logs' || chat.selection?.isSelecting) return false;
+    if(chat.type === 'pinned' || chat.type === 'logs') return false;
 
     const bubble = target.closest?.('.bubble[data-mid]') as HTMLElement | null;
     const лента = bubble?.closest('.bubbles') as HTMLElement | null;
@@ -1092,14 +1097,28 @@ function swipeToPanel() {
     if(['service', 'is-sending', 'is-sponsored', 'is-date'].some((name) => bubble.classList.contains(name))) return false;
     if(внутриЕдетВлево(target, лента)) return false;
 
+    /*
+     * Режим выделения (168): свайп только по выделенному — он уносит все
+     * выделенные разом, как бросок пачки. По невыделенному жест целиком
+     * уходит прокрутке, и ничего не случается.
+     */
+    const выделение = chat.selection?.isSelecting === true;
+    if(выделение && !bubble.classList.contains('is-selected')) return false;
+
     пузырь = bubble;
     аватар = undefined;
     начато = false;
     сдвиг = 0;
+    пачкой = выделение;
 
+    /*
+     * Аватарка едет с пузырём только вне выделения. В выделении Web K
+     * держит её своим сдвигом и уменьшением, и наш сдвиг строкой стиля их
+     * сбил бы; к тому же едет только пузырь под пальцами (168).
+     */
     try {
       const свой = bubble.parentElement?.querySelector('.bubbles-group-avatar') as HTMLElement | null;
-      if(свой && вн.getVisibleRect(свой, bubble)) аватар = свой;
+      if(!выделение && свой && вн.getVisibleRect(свой, bubble)) аватар = свой;
     } catch(err) {}
 
     return true;
@@ -1110,6 +1129,19 @@ function swipeToPanel() {
 
     if(!начато) {
       начато = true;
+
+      /*
+       * В выделении Web K сдвигает содержимое входящего пузыря, и коробка
+       * содержимого становится точкой отсчёта для значка. Говорим слою
+       * стилей, на сколько она ушла от края пузыря, — значок встанет туда
+       * же, где стоит вне выделения (168).
+       */
+      const коробка = пузырь.querySelector('.bubble-content-wrapper');
+      if(пачкой && коробка) {
+        const уход = коробка.getBoundingClientRect().left - пузырь.getBoundingClientRect().left;
+        пузырь.style.setProperty('--piloot-swipe-shift', `${Math.round(уход)}px`);
+      }
+
       for(const element of [пузырь, аватар].filter(Boolean)) {
         вн.SetTransition({element, className: КЛАСС, forwards: true, duration: 250});
         void element.offsetLeft;
@@ -1152,6 +1184,7 @@ function swipeToPanel() {
           bubble.removeAttribute('data-piloot-swipe');
           bubble.removeAttribute('data-piloot-swipe-hiding');
           bubble.style.removeProperty('--piloot-swipe-opacity');
+          bubble.style.removeProperty('--piloot-swipe-shift');
         } : undefined
       });
     });
@@ -1162,6 +1195,11 @@ function swipeToPanel() {
     });
 
     if(!итог) return;
+
+    if(пачкой) {
+      void отдатьВыделенные();
+      return;
+    }
 
     const peerId = bubble.dataset.peerId?.toPeerId?.() ?? вн.appImManager.chat?.peerId;
     const mid = Number(bubble.dataset.mid);
@@ -1175,6 +1213,27 @@ function swipeToPanel() {
         if(payload) window.parent.postMessage({[MARK]: 1, event: 'ticket', payloads: [payload]}, '*');
       });
     });
+  };
+
+  /*
+   * Все выделенные — одной вестью, как пункт меню при выделении; порядок
+   * по времени, название из самого раннего — дело панели. Затем выделение
+   * снимается тем же вызовом, каким Web K снимает его после «Переслать».
+   */
+  const отдатьВыделенные = async() => {
+    const chat = вн?.appImManager?.chat;
+    const выделенные: Map<any, Set<number>> | undefined = chat?.selection?.selectedMids;
+    if(!chat || !вн || !выделенные?.size) return;
+
+    const пары = [...выделенные].flatMap(([peerId, mids]) => [...mids].map((mid) => ({peerId, mid})));
+    const найденные = await Promise.all(пары.map(async({peerId, mid}) => {
+      const message: any = await вн.rootScope.managers.appMessagesManager.getMessageByPeer(peerId, mid);
+      return message?._ === 'message' ? messagePayload(peerId, mid) : null;
+    }));
+    const payloads = найденные.filter(Boolean);
+
+    if(payloads.length) window.parent.postMessage({[MARK]: 1, event: 'ticket', payloads}, '*');
+    chat.selection.cancelSelection();
   };
 
   const тихо = (правило: any) => {
