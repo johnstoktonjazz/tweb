@@ -693,6 +693,21 @@ async function handle(ask: any) {
     case 'canWrite':
       return можноПисать();
 
+    case 'startNeeded': {
+      /*
+       * Нужна ли в открытом чате бота кнопка «Старт» (Piloot 174): человек
+       * этого бота ещё не запускал. Сами мы её не нажимаем никогда.
+       */
+      const chat = appImManager.chat;
+      if(!chat || String(chat.peerId) !== String(ask.chatId)) return false;
+      return chat.isStartButtonNeeded();
+    }
+
+    case 'watchBot':
+      /* Слушать сообщения одного чата бота (Piloot 174); null — перестать. */
+      слушаемБота = ask.chatId ? String(ask.chatId) : null;
+      return true;
+
     case 'invoke':
       /*
        * Дверь ко всему Telegram API. Через неё пойдут расшифровка голосового,
@@ -1545,6 +1560,43 @@ function следитьЗаРеакциями() {
   });
 }
 
+/*
+ * Чат бота Piloot (Piloot 174): новые сообщения одного чата — входящие и
+ * отправленные человеком. Входящее с ключом панель передаёт главному
+ * процессу; отправленное «/start» запускает у неё отсчёт ожидания. Сами
+ * ничего не отправляем, не нажимаем и прочитанным не отмечаем.
+ */
+let слушаемБота: string | null = null;
+
+function следитьЗаБотом() {
+  void web().then(({rootScope}) => {
+    const уже = new Set<string>();
+    const передать = (message: any) => {
+      if(!слушаемБота || message?._ !== 'message' || String(message.peerId) !== слушаемБота) return;
+      const out = !!message.pFlags?.out;
+      /* У отправляемого номер пока временный, дробный: ему номер и не нужен. */
+      if(!out && !Number.isInteger(message.mid)) return;
+
+      const метка = `${out ? 'o' : 'i'}:${message.mid}`;
+      if(уже.has(метка)) return;
+      уже.add(метка);
+      if(уже.size > 200) уже.clear();
+
+      window.parent.postMessage({
+        [MARK]: 1,
+        event: 'botMessage',
+        chatId: слушаемБота,
+        messageId: String(message.mid),
+        out,
+        text: String(message.message ?? '')
+      }, '*');
+    };
+
+    rootScope.addEventListener('history_multiappend', (message: any) => передать(message));
+    rootScope.addEventListener('history_append', ({message}: any) => передать(message));
+  });
+}
+
 if(framed) {
   /*
    * Зеркало передаём не сообщением, а прямым вызовом: холст через
@@ -1559,7 +1611,8 @@ if(framed) {
   /*
    * Всё, что трогает внутренности Web K, — только после входа (156): тема,
    * смена чата, перетаскивание, задержка броска, пункт меню сообщения,
-   * свайп вправо (164), тикет обратно в чат (167), реакции (166).
+   * свайп вправо (164), тикет обратно в чат (167), реакции (166), чат
+   * бота (174).
    */
   void входПроизошёл.then(() => {
     следитьЗаТемойИЧатом();
@@ -1570,5 +1623,6 @@ if(framed) {
     следитьЗаОтправкой();
     принятьТикеты();
     следитьЗаРеакциями();
+    следитьЗаБотом();
   });
 }
