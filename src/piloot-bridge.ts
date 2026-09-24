@@ -42,6 +42,9 @@ type Внутренности = {
   cancelContextMenuOpening: any;
   placeCaretAtEnd: any;
   isInputEmpty: any;
+  getUserStatusString: any;
+  AppSharedMediaTab: any;
+  appSidebarLeft: any;
 };
 
 let взятое: Promise<Внутренности> | undefined;
@@ -62,8 +65,11 @@ function web(): Promise<Внутренности> {
     import('@helpers/dom/getVisibleRect'),
     import('@helpers/dom/attachContextMenuListener'),
     import('@helpers/dom/placeCaretAtEnd'),
-    import('@helpers/dom/isInputEmpty')
-  ]).then(([im, proxy, downloads, choose, scope, theme, background, pattern, menu, transition, schedulers, visible, contextMenu, caret, empty]) => ({
+    import('@helpers/dom/isInputEmpty'),
+    import('@components/wrappers/getUserStatusString'),
+    import('@components/sidebarRight/tabs/sharedMediaTab'),
+    import('@components/sidebarLeft')
+  ]).then(([im, proxy, downloads, choose, scope, theme, background, pattern, menu, transition, schedulers, visible, contextMenu, caret, empty, status, profile, left]) => ({
     appImManager: im.default,
     apiManagerProxy: proxy.default,
     appDownloadManager: downloads.default,
@@ -78,7 +84,10 @@ function web(): Promise<Внутренности> {
     getVisibleRect: visible.default,
     cancelContextMenuOpening: contextMenu.cancelContextMenuOpening,
     placeCaretAtEnd: caret.default,
-    isInputEmpty: empty.default
+    isInputEmpty: empty.default,
+    getUserStatusString: status.default,
+    AppSharedMediaTab: profile.default,
+    appSidebarLeft: left.default
   }));
 
   return взятое;
@@ -403,15 +412,35 @@ async function reactionsOf(peerId: PeerId, ids: number[]) {
  * Именно строкой, а не ссылкой на объект: ссылка живёт в этой рамке и
  * умирает вместе с ней, а картинка нужна панели снаружи.
  */
-async function photoOf(peerId: PeerId): Promise<string | null> {
+async function photoOf(peerId: PeerId, big = false): Promise<string | null> {
   const {rootScope, apiManagerProxy} = await web();
   const photo: any = await rootScope.managers.appPeersManager.getPeerPhoto(peerId);
   if(!photo) return null;
 
-  const url = await apiManagerProxy.loadAvatar(peerId, photo, 'photo_small');
+  /*
+   * Большое — для шторки человека (Piloot 204): там аватар крупный, как в
+   * профиле Web K, и маленькое (160 точек) на нем выходит мыльным.
+   */
+  const url = await apiManagerProxy.loadAvatar(peerId, photo, big ? 'photo_big' : 'photo_small');
   if(!url) return null;
 
   return asDataUrl(url);
+}
+
+/**
+ * Статус человека словами самого Web K (Piloot 204): «в сети», «был
+ * недавно» — его языком и его правилом, как под именем в его профиле.
+ * `online` — красит ли он строку своим синим.
+ */
+async function statusOf(peerId: PeerId): Promise<{text: string, online: boolean} | null> {
+  const {rootScope, getUserStatusString} = await web();
+  if(!peerId.isUser()) return null;
+
+  const user: any = await rootScope.managers.appUsersManager.getUser(peerId.toUserId());
+  if(!user) return null;
+
+  const text = (getUserStatusString(user) as HTMLElement).textContent ?? '';
+  return {text, online: user.status?._ === 'userStatusOnline'};
 }
 
 /**
@@ -651,7 +680,10 @@ async function handle(ask: any) {
       return reactionsOf(String(ask.chatId).toPeerId(), (ask.ids ?? []).map(Number).filter(Number.isInteger));
 
     case 'photo':
-      return photoOf(ask.peerId.toPeerId());
+      return photoOf(ask.peerId.toPeerId(), ask.big === true);
+
+    case 'status':
+      return statusOf(ask.peerId.toPeerId());
 
     case 'thumb':
       return thumbOf(ask.chatId.toPeerId(), Number(ask.messageId), Number(ask.width));
@@ -671,6 +703,17 @@ async function handle(ask: any) {
     case 'openChat': {
       // Заменяет наш прежний экран профиля: разговор открывает Telegram.
       await appImManager.setPeer({peerId: ask.peerId.toPeerId()});
+      return true;
+    }
+
+    case 'openProfile': {
+      /*
+       * Профиль человека (Piloot 204) — тем же, чем Web K сам открывает
+       * профиль в левой колонке (appDialogsManager, свои «Избранные»).
+       * Чат при этом не открывается и прочитанным ничего не становится.
+       */
+      const {AppSharedMediaTab, appSidebarLeft} = await web();
+      await AppSharedMediaTab.open(appSidebarLeft, ask.peerId.toPeerId());
       return true;
     }
 
