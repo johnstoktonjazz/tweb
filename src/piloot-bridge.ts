@@ -406,6 +406,109 @@ async function reactionsOf(peerId: PeerId, ids: number[]) {
   return итог;
 }
 
+/*
+ * Тексты сообщений по номерам (Piloot 206) — только чтение.
+ *
+ * Тот же прямой запрос по номерам, что у реакций: чат не открывается, в
+ * память Web K сообщения не ложатся, прочитанным ничего не отмечается.
+ * Номера — серверные. В личных чатах и обычных группах номер сообщения
+ * общий на весь аккаунт, поэтому сверяем, что сообщение — из этого чата:
+ * чужое не отдаем вовсе. Нет сообщения — `gone`.
+ */
+function чатИз(peer: any): string | null {
+  if(peer?._ === 'peerUser') return String(peer.user_id);
+  if(peer?._ === 'peerChat') return String(-peer.chat_id);
+  if(peer?._ === 'peerChannel') return String(-peer.channel_id);
+  return null;
+}
+
+function имяИз(peerId: string, users: any[], chats: any[]): string {
+  const номер = Number(peerId);
+  if(номер > 0) {
+    const человек = users.find((one: any) => String(one?.id) === peerId);
+    return человек ? [человек.first_name, человек.last_name].filter(Boolean).join(' ') : '';
+  }
+
+  const чат = chats.find((one: any) => String(-one?.id) === peerId);
+  return чат?.title ?? '';
+}
+
+async function textsOf(peerId: PeerId, ids: number[]) {
+  const {rootScope} = await web();
+  const m = rootScope.managers;
+  const личный = await m.appPeersManager.isUser(peerId);
+  const канал = !личный && await m.appPeersManager.isChannel(peerId);
+  const номера = ids.slice(0, СООБЩЕНИЙ_ЗА_РАЗ).map((id) => ({_: 'inputMessageID', id}));
+  const ответ: any = канал ?
+    await m.apiManager.invokeApi('channels.getMessages', {
+      channel: await m.appChatsManager.getChannelInput(peerId.toChatId()),
+      id: номера
+    } as any) :
+    await m.apiManager.invokeApi('messages.getMessages', {id: номера} as any);
+  const users: any[] = ответ?.users ?? [];
+  const chats: any[] = ответ?.chats ?? [];
+  const пришли = new Map<number, any>();
+  for(const message of ответ?.messages ?? []) {
+    if(message?._ === 'message') пришли.set(message.id, message);
+  }
+
+  const мой = String(rootScope.myId);
+
+  return ids.slice(0, СООБЩЕНИЙ_ЗА_РАЗ).map((id) => {
+    const message = пришли.get(id);
+    if(!message) return {id, gone: true};
+    /* Номер из другого чата этого аккаунта — не наше сообщение. */
+    if(чатИз(message.peer_id) !== String(peerId)) return {id, foreign: true};
+
+    const автор = чатИз(message.from_id) ?? (message.out ? мой : String(peerId));
+
+    return {
+      id,
+      text: String(message.message ?? ''),
+      from: {name: имяИз(автор, users, chats), id: автор},
+      date: Number(message.date) || 0,
+      // Приметы вложения, а не сам файл: правило 3 Piloot. Документы — без примет.
+      ...(message.media?._ === 'messageMediaPhoto' ? {media: {kind: 'photo'}} : {})
+    };
+  });
+}
+
+/*
+ * История чата без текста (Piloot 206): номера, даты и реакции — для
+ * поиска ✍, поставленных, пока мак был выключен. Прямой запрос истории:
+ * чат не открывается, прочитанным ничего не отмечается, в память Web K
+ * сообщения не ложатся. Текста сообщений панель отсюда не получает.
+ *
+ * `emoji` — какие знаки стоят на сообщении; `seen` — кто поставил, если
+ * короткий список внутри сообщения полон.
+ */
+async function historyOf(peerId: PeerId, offsetId: number, limit: number) {
+  const {rootScope} = await web();
+  const m = rootScope.managers;
+  const личный = await m.appPeersManager.isUser(peerId);
+  const ответ: any = await m.apiManager.invokeApi('messages.getHistory', {
+    peer: await m.appPeersManager.getInputPeerById(peerId),
+    offset_id: offsetId,
+    offset_date: 0,
+    add_offset: 0,
+    limit: Math.max(1, Math.min(СООБЩЕНИЙ_ЗА_РАЗ, limit)),
+    max_id: 0,
+    min_id: 0,
+    hash: 0
+  } as any);
+
+  return (ответ?.messages ?? [])
+  .filter((message: any) => message?._ === 'message')
+  .map((message: any) => {
+    const знаки: string[] = (message.reactions?.results ?? [])
+    .filter((one: any) => one?.reaction?._ === 'reactionEmoji')
+    .map((one: any) => String(one.reaction.emoticon));
+    const seen = знаки.length > 0 ? реакцииИзПамяти(message, личный) : undefined;
+
+    return {id: message.id, date: Number(message.date) || 0, emoji: знаки, ...(seen ? {seen} : {})};
+  });
+}
+
 /**
  * Аватарка картинкой — по требованию и как самодостаточная строка.
  *
@@ -678,6 +781,12 @@ async function handle(ask: any) {
 
     case 'reactions':
       return reactionsOf(String(ask.chatId).toPeerId(), (ask.ids ?? []).map(Number).filter(Number.isInteger));
+
+    case 'texts':
+      return textsOf(String(ask.chatId).toPeerId(), (ask.ids ?? []).map(Number).filter(Number.isInteger));
+
+    case 'history':
+      return historyOf(String(ask.chatId).toPeerId(), Number(ask.offsetId) || 0, Number(ask.limit) || СООБЩЕНИЙ_ЗА_РАЗ);
 
     case 'photo':
       return photoOf(ask.peerId.toPeerId(), ask.big === true);
@@ -1687,6 +1796,27 @@ function следитьЗаБотом() {
   });
 }
 
+/*
+ * Сообщение поправили или удалили (Piloot 206): панели — только чат, вид
+ * и номера, без текста. Свои источники она найдет сама и новый текст
+ * спросит сама. Web K знает о правке и удалении только тех сообщений,
+ * что у него в памяти, — остальное панель узнает загрузкой по номеру.
+ */
+function следитьЗаПравками() {
+  void web().then(({rootScope}) => {
+    const передать = (peerId: PeerId, mids: number[], change: 'edit' | 'delete') => {
+      const номера = mids.filter((mid) => Number.isInteger(mid));
+      if(!номера.length) return;
+      void kindOf(peerId).then((kind) => {
+        window.parent.postMessage({[MARK]: 1, event: 'messagesChanged', chatId: String(peerId), kind, mids: номера, change}, '*');
+      });
+    };
+
+    rootScope.addEventListener('message_edit', ({peerId, mid}: any) => передать(peerId, [mid], 'edit'));
+    rootScope.addEventListener('history_delete', ({peerId, msgs}: any) => передать(peerId, [...(msgs ?? [])], 'delete'));
+  });
+}
+
 if(framed) {
   /*
    * Зеркало передаём не сообщением, а прямым вызовом: холст через
@@ -1702,7 +1832,7 @@ if(framed) {
    * Всё, что трогает внутренности Web K, — только после входа (156): тема,
    * смена чата, перетаскивание, задержка броска, пункт меню сообщения,
    * свайп вправо (164), тикет обратно в чат (167), реакции (166), чат
-   * бота (174).
+   * бота (174), правки и удаления сообщений (206).
    */
   void входПроизошёл.then(() => {
     следитьЗаТемойИЧатом();
@@ -1714,5 +1844,6 @@ if(framed) {
     принятьТикеты();
     следитьЗаРеакциями();
     следитьЗаБотом();
+    следитьЗаПравками();
   });
 }
