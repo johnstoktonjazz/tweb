@@ -346,6 +346,36 @@ async function membersOf(peerId: PeerId) {
  */
 const СООБЩЕНИЙ_ЗА_РАЗ = 100;
 const СТРАНИЦ_СПИСКА = 5;
+/*
+ * Страниц полного списка реакций — на весь вопрос, а не на сообщение, и с
+ * паузой между ними (Piloot 207). До 207 один вопрос мог выпустить до 500
+ * страниц подряд без паузы. Не хватило — остальные сообщения в ответ не
+ * попадают: панель спросит их в следующий раз.
+ */
+const СТРАНИЦ_НА_ВОПРОС = 10;
+const ПАУЗА_СТРАНИЦ_МС = 500;
+/*
+ * Фоновые запросы Piloot (Piloot 207): «подождите» от Telegram сразу
+ * отдаем панели, а не выжидаем его молча до минуты. Панель держит одну
+ * очередь и молчит до конца ожидания для всех, а не шлет следующий запрос.
+ */
+const ФОН = {floodMaxTimeout: 0};
+/*
+ * Методы двери `invoke` (Piloot 207): свой номер, имя бота для подключения,
+ * тон ИИ и переписывание текста задачи. Все — только чтение или правка
+ * своего тона; ни один ничего не отправляет от имени человека. Список
+ * повторяет src/shared/telegramMethods.ts Piloot; совпадение держит проверка.
+ */
+const МОЖНО_ЗВАТЬ = new Set([
+  'users.getUsers',
+  'contacts.resolveUsername',
+  'aicompose.getTones',
+  'aicompose.createTone',
+  'aicompose.getTone',
+  'aicompose.updateTone',
+  'messages.composeMessageWithAI'
+]);
+const пауза = (мс: number) => new Promise<void>((готово) => setTimeout(готово, мс));
 
 async function reactionsOf(peerId: PeerId, ids: number[]) {
   const {rootScope} = await web();
@@ -357,12 +387,13 @@ async function reactionsOf(peerId: PeerId, ids: number[]) {
     await m.apiManager.invokeApi('channels.getMessages', {
       channel: await m.appChatsManager.getChannelInput(peerId.toChatId()),
       id: номера
-    } as any) :
-    await m.apiManager.invokeApi('messages.getMessages', {id: номера} as any);
+    } as any, ФОН) :
+    await m.apiManager.invokeApi('messages.getMessages', {id: номера} as any, ФОН);
   const пришли = new Map<number, any>();
   for(const message of ответ?.messages ?? []) {
     if(message?._ === 'message') пришли.set(message.id, message);
   }
+  let страниц = 0;
 
   const вход = await m.appPeersManager.getInputPeerById(peerId);
   const итог = [];
@@ -380,19 +411,26 @@ async function reactionsOf(peerId: PeerId, ids: number[]) {
       continue;
     }
 
+    /* Страницы на вопрос кончились — это сообщение в этот раз не спрашиваем: панель спросит снова. */
+    if(страниц >= СТРАНИЦ_НА_ВОПРОС) continue;
+
     const список: any[] = [];
     let offset: string | undefined;
-    for(let страница = 0; страница < СТРАНИЦ_СПИСКА; ++страница) {
+    for(let страница = 0; страница < СТРАНИЦ_СПИСКА && страниц < СТРАНИЦ_НА_ВОПРОС; ++страница) {
+      if(страниц > 0) await пауза(ПАУЗА_СТРАНИЦ_МС);
+      страниц += 1;
       const часть: any = await m.apiManager.invokeApi('messages.getMessageReactionsList', {
         peer: вход,
         id,
         limit: 100,
         ...(offset ? {offset} : {})
-      } as any);
+      } as any, ФОН);
       список.push(...(часть?.reactions ?? []).filter((one: any) => one?.reaction?._ === 'reactionEmoji'));
       offset = часть?.next_offset;
       if(!offset) break;
     }
+    /* Список недочитан, а страницы кончились — неполное «кто поставил» не отдаем. */
+    if(offset && страниц >= СТРАНИЦ_НА_ВОПРОС) continue;
 
     итог.push({
       id,
@@ -448,8 +486,8 @@ async function textsOf(peerId: PeerId, ids: number[]) {
     await m.apiManager.invokeApi('channels.getMessages', {
       channel: await m.appChatsManager.getChannelInput(peerId.toChatId()),
       id: номера
-    } as any) :
-    await m.apiManager.invokeApi('messages.getMessages', {id: номера} as any);
+    } as any, ФОН) :
+    await m.apiManager.invokeApi('messages.getMessages', {id: номера} as any, ФОН);
   const users: any[] = ответ?.users ?? [];
   const chats: any[] = ответ?.chats ?? [];
   const пришли = new Map<number, any>();
@@ -503,7 +541,7 @@ async function historyOf(peerId: PeerId, offsetId: number, limit: number) {
     max_id: 0,
     min_id: 0,
     hash: 0
-  } as any);
+  } as any, ФОН);
 
   return (ответ?.messages ?? [])
   .filter((message: any) => message?._ === 'message')
@@ -873,10 +911,14 @@ async function handle(ask: any) {
 
     case 'invoke':
       /*
-       * Дверь ко всему Telegram API. Через неё пойдут расшифровка голосового,
-       * ИИ-тон и напоминания — без новой правки Web K на каждый случай.
+       * Дверь к Telegram API — только для методов из списка (Piloot 207).
+       * До 207 она пускала любой метод, и правило «Piloot ничего не шлет
+       * сам» держалось на аккуратности панели. Теперь его держит код:
+       * отправка, пересылка, реакции, «прочитано» сюда не проходят.
+       * Фоновый вызов (`background`) — с быстрым «подождите».
        */
-      return rootScope.managers.apiManager.invokeApi(ask.method, ask.params ?? {});
+      if(!МОЖНО_ЗВАТЬ.has(String(ask.method))) throw new Error('METHOD_NOT_ALLOWED');
+      return rootScope.managers.apiManager.invokeApi(ask.method, ask.params ?? {}, ask.background === true ? ФОН : undefined);
 
     default:
       throw new Error('неизвестный вопрос: ' + ask.kind);
