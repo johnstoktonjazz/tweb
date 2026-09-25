@@ -413,7 +413,12 @@ async function reactionsOf(peerId: PeerId, ids: number[]) {
  * память Web K сообщения не ложатся, прочитанным ничего не отмечается.
  * Номера — серверные. В личных чатах и обычных группах номер сообщения
  * общий на весь аккаунт, поэтому сверяем, что сообщение — из этого чата:
- * чужое не отдаем вовсе. Нет сообщения — `gone`.
+ * чужое не отдаем вовсе.
+ *
+ * «Нет такого» (`gone`) — только явный ответ Telegram «сообщение пусто»
+ * (Piloot 206, решение владельца). Служебное сообщение («X вступил в
+ * группу») — `service`: оно есть, текста у него нет. Номер, который сервер
+ * не вернул вовсе, — `unknown`: ничего не решаем.
  */
 function чатИз(peer: any): string | null {
   if(peer?._ === 'peerUser') return String(peer.user_id);
@@ -449,16 +454,18 @@ async function textsOf(peerId: PeerId, ids: number[]) {
   const chats: any[] = ответ?.chats ?? [];
   const пришли = new Map<number, any>();
   for(const message of ответ?.messages ?? []) {
-    if(message?._ === 'message') пришли.set(message.id, message);
+    if(Number.isInteger(message?.id)) пришли.set(message.id, message);
   }
 
   const мой = String(rootScope.myId);
 
   return ids.slice(0, СООБЩЕНИЙ_ЗА_РАЗ).map((id) => {
     const message = пришли.get(id);
-    if(!message) return {id, gone: true};
+    if(!message) return {id, unknown: true};
+    if(message._ === 'messageEmpty') return {id, gone: true};
     /* Номер из другого чата этого аккаунта — не наше сообщение. */
     if(чатИз(message.peer_id) !== String(peerId)) return {id, foreign: true};
+    if(message._ !== 'message') return {id, service: true};
 
     const автор = чатИз(message.from_id) ?? (message.out ? мой : String(peerId));
 
@@ -479,7 +486,8 @@ async function textsOf(peerId: PeerId, ids: number[]) {
  * чат не открывается, прочитанным ничего не отмечается, в память Web K
  * сообщения не ложатся. Текста сообщений панель отсюда не получает.
  *
- * `emoji` — какие знаки стоят на сообщении; `seen` — кто поставил, если
+ * `emoji` — какие знаки стоят на сообщении; `mine` — какие из них поставил
+ * я (Telegram помечает их порядком выбора); `seen` — кто поставил, если
  * короткий список внутри сообщения полон.
  */
 async function historyOf(peerId: PeerId, offsetId: number, limit: number) {
@@ -503,9 +511,12 @@ async function historyOf(peerId: PeerId, offsetId: number, limit: number) {
     const знаки: string[] = (message.reactions?.results ?? [])
     .filter((one: any) => one?.reaction?._ === 'reactionEmoji')
     .map((one: any) => String(one.reaction.emoticon));
+    const мои: string[] = (message.reactions?.results ?? [])
+    .filter((one: any) => one?.reaction?._ === 'reactionEmoji' && typeof one.chosen_order === 'number')
+    .map((one: any) => String(one.reaction.emoticon));
     const seen = знаки.length > 0 ? реакцииИзПамяти(message, личный) : undefined;
 
-    return {id: message.id, date: Number(message.date) || 0, emoji: знаки, ...(seen ? {seen} : {})};
+    return {id: message.id, date: Number(message.date) || 0, emoji: знаки, mine: мои, ...(seen ? {seen} : {})};
   });
 }
 
@@ -1797,6 +1808,21 @@ function следитьЗаБотом() {
 }
 
 /*
+ * Служебное окошко Telegram (Piloot 206): сервер прислал весть с флагом
+ * «окошко», и Web K показал его сам. Панели — только сам факт, без текста:
+ * по времени она сверяет его со своими фоновыми запросами и пишет в журнал,
+ * какой запрос стоял рядом. Так ищется причина окошка «an error occurred».
+ */
+function следитьЗаОкошками() {
+  void web().then(({rootScope}) => {
+    rootScope.addEventListener('service_notification', (update: any) => {
+      if(!update?.pFlags?.popup) return;
+      window.parent.postMessage({[MARK]: 1, event: 'servicePopup'}, '*');
+    });
+  });
+}
+
+/*
  * Сообщение поправили или удалили (Piloot 206): панели — только чат, вид
  * и номера, без текста. Свои источники она найдет сама и новый текст
  * спросит сама. Web K знает о правке и удалении только тех сообщений,
@@ -1845,5 +1871,6 @@ if(framed) {
     следитьЗаРеакциями();
     следитьЗаБотом();
     следитьЗаПравками();
+    следитьЗаОкошками();
   });
 }
