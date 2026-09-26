@@ -393,7 +393,7 @@ async function reactionsOf(peerId: PeerId, ids: number[]) {
    */
   const нет: number[] = [];
   for(const id of ids.slice(0, СООБЩЕНИЙ_ЗА_РАЗ)) {
-    const mid = m.appMessagesIdsManager.generateMessageId(id, channelId);
+    const mid = await m.appMessagesIdsManager.generateMessageId(id, channelId);
     const вПамяти: any = await m.appMessagesManager.getMessageByPeer(peerId, mid);
     if(вПамяти?._ === 'message' && реакцииИзПамяти(вПамяти, личный) !== undefined) пришли.set(id, вПамяти);
     else нет.push(id);
