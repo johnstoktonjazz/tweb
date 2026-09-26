@@ -382,16 +382,34 @@ async function reactionsOf(peerId: PeerId, ids: number[]) {
   const m = rootScope.managers;
   const личный = await m.appPeersManager.isUser(peerId);
   const канал = !личный && await m.appPeersManager.isChannel(peerId);
-  const номера = ids.slice(0, СООБЩЕНИЙ_ЗА_РАЗ).map((id) => ({_: 'inputMessageID', id}));
-  const ответ: any = канал ?
-    await m.apiManager.invokeApi('channels.getMessages', {
-      channel: await m.appChatsManager.getChannelInput(peerId.toChatId()),
-      id: номера
-    } as any, ФОН) :
-    await m.apiManager.invokeApi('messages.getMessages', {id: номера} as any, ФОН);
+  const channelId = канал ? peerId.toChatId() : undefined;
   const пришли = new Map<number, any>();
-  for(const message of ответ?.messages ?? []) {
-    if(message?._ === 'message') пришли.set(message.id, message);
+  /*
+   * Сначала память Web K (Piloot 207): сообщение уже загружено и короткий
+   * список реакций полон — Telegram не спрашиваем. Спрашиваем только то,
+   * чего в памяти нет, и загруженное кладем в память Web K (`saveApiResult`):
+   * дальше живые вести о реакциях на эти сообщения он не выбросит — весть
+   * о сообщении не в памяти Web K отбрасывает.
+   */
+  const нет: number[] = [];
+  for(const id of ids.slice(0, СООБЩЕНИЙ_ЗА_РАЗ)) {
+    const mid = m.appMessagesIdsManager.generateMessageId(id, channelId);
+    const вПамяти: any = await m.appMessagesManager.getMessageByPeer(peerId, mid);
+    if(вПамяти?._ === 'message' && реакцииИзПамяти(вПамяти, личный) !== undefined) пришли.set(id, вПамяти);
+    else нет.push(id);
+  }
+  if(нет.length) {
+    const номера = нет.map((id) => ({_: 'inputMessageID', id}));
+    const ответ: any = канал ?
+      await m.apiManager.invokeApi('channels.getMessages', {
+        channel: await m.appChatsManager.getChannelInput(peerId.toChatId()),
+        id: номера
+      } as any, ФОН) :
+      await m.apiManager.invokeApi('messages.getMessages', {id: номера} as any, ФОН);
+    if(ответ?.messages) await m.appMessagesManager.saveApiResult(ответ);
+    for(const message of ответ?.messages ?? []) {
+      if(message?._ === 'message') пришли.set(message.id, message);
+    }
   }
   let страниц = 0;
 
@@ -442,6 +460,15 @@ async function reactionsOf(peerId: PeerId, ids: number[]) {
   }
 
   return итог;
+}
+
+/** Серверный номер последнего сообщения чата — из памяти Web K, без запроса (Piloot 207). */
+async function dialogTopOf(peerId: PeerId) {
+  const {rootScope} = await web();
+  const m = rootScope.managers;
+  const dialog: any = await m.appMessagesManager.getDialogOnly(peerId);
+  const mid = dialog?.top_message;
+  return Number.isInteger(mid) ? (await m.appMessagesIdsManager.getMessageIdInfo(mid)).messageId : null;
 }
 
 /*
@@ -833,6 +860,14 @@ async function handle(ask: any) {
 
     case 'texts':
       return textsOf(String(ask.chatId).toPeerId(), (ask.ids ?? []).map(Number).filter(Number.isInteger));
+
+    case 'dialogTop':
+      /*
+       * Последнее сообщение чата из памяти Web K (Piloot 207) — серверный
+       * номер, без запроса: просмотр ✍ при запуске смотрит только чаты, где
+       * с прошлого раза появились новые сообщения. Чата в памяти нет — null.
+       */
+      return dialogTopOf(String(ask.chatId).toPeerId());
 
     case 'history':
       return historyOf(String(ask.chatId).toPeerId(), Number(ask.offsetId) || 0, Number(ask.limit) || СООБЩЕНИЙ_ЗА_РАЗ);
@@ -1792,6 +1827,24 @@ function реакцииИзПамяти(message: any, личный: boolean) {
   };
 }
 
+/*
+ * В чате появилось новое сообщение (Piloot 207): панели — только номер
+ * чата, без текста и без номера сообщения. Повод спросить реакции на
+ * источники ждущих тикетов этого чата — вместо опроса по расписанию.
+ */
+function следитьЗаНовым() {
+  void web().then(({rootScope}) => {
+    const сказать = (message: any): void => {
+      if(!message?.peerId) return;
+      void kindOf(message.peerId).then((kind) => {
+        window.parent.postMessage({[MARK]: 1, event: 'chatNews', chatId: String(message.peerId), kind}, '*');
+      });
+    };
+    rootScope.addEventListener('history_multiappend', (message: any) => сказать(message));
+    rootScope.addEventListener('history_append', ({message}: any) => сказать(message));
+  });
+}
+
 function следитьЗаРеакциями() {
   void web().then(({rootScope}) => {
     rootScope.addEventListener('messages_reactions', (items: any[]) => {
@@ -1943,6 +1996,7 @@ if(framed) {
     следитьЗаОтправкой();
     принятьТикеты();
     следитьЗаРеакциями();
+    следитьЗаНовым();
     следитьЗаБотом();
     следитьЗаПравками();
     следитьЗаОкошками();
