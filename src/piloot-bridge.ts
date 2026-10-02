@@ -546,6 +546,69 @@ async function textsOf(peerId: PeerId, ids: number[]) {
 }
 
 /*
+ * Части общего ключа сообщений (Piloot 216): то, что Telegram отдает всем
+ * участникам чата одинаково, — автор, время отправки как прислал сервер
+ * (Web K у себя сдвигает его на поправку часов), номер файла, пересылка и
+ * который это по счету из сообщений автора в ту же секунду. Прямой запрос:
+ * чат не открывается, прочитанным ничего не отмечается. Только личные
+ * чаты и обычные группы: в супергруппе номер сообщения и так общий.
+ */
+async function keysOf(peerId: PeerId, ids: number[]) {
+  const {rootScope} = await web();
+  const m = rootScope.managers;
+  const личный = await m.appPeersManager.isUser(peerId);
+  const канал = !личный && await m.appPeersManager.isChannel(peerId);
+  if(канал) return ids.map((id) => ({id, missing: true}));
+
+  const номера = ids.slice(0, 20);
+  const ответ: any = await m.apiManager.invokeApi('messages.getMessages', {id: номера.map((id) => ({_: 'inputMessageID', id}))} as any, ФОН);
+  const пришли = new Map<number, any>();
+  for(const message of ответ?.messages ?? []) {
+    if(Number.isInteger(message?.id)) пришли.set(message.id, message);
+  }
+
+  const мой = String(rootScope.myId);
+  const автор = (message: any) => чатИз(message.from_id) ?? (message.pFlags?.out || message.out ? мой : String(peerId));
+  const итог: any[] = [];
+
+  for(const id of номера) {
+    const message = пришли.get(id);
+    if(!message || message._ !== 'message' || чатИз(message.peer_id) !== String(peerId)) {
+      итог.push({id, missing: true});
+      continue;
+    }
+
+    const кто = автор(message);
+    const date = Number(message.date) || 0;
+    const файл = message.media?.photo?.id ?? message.media?.document?.id;
+    const пересылка = message.fwd_from;
+    // Сколько сообщений этого автора в ту же секунду раньше этого.
+    const раньше: any = await m.apiManager.invokeApi('messages.getHistory', {
+      peer: await m.appPeersManager.getInputPeerById(peerId),
+      offset_id: id,
+      offset_date: 0,
+      add_offset: 0,
+      limit: 20,
+      max_id: 0,
+      min_id: 0,
+      hash: 0
+    } as any, ФОН);
+    const ordinal = (раньше?.messages ?? []).filter((one: any) => one?._ === 'message' && one.id < id && Number(one.date) === date && автор(one) === кто).length;
+
+    итог.push({
+      id,
+      author: кто,
+      date,
+      ...(файл === undefined || файл === null ? {} : {mediaId: String(файл)}),
+      ...(пересылка && Number.isInteger(Number(пересылка.date)) ? {fwdDate: Number(пересылка.date), fwdFrom: String(чатИз(пересылка.from_id) ?? пересылка.from_name ?? '')} : {}),
+      ordinal
+    });
+  }
+
+  return итог;
+}
+
+/*
  * История чата без текста (Piloot 206): номера, даты и реакции — для
  * поиска ✍, поставленных, пока мак был выключен. Прямой запрос истории:
  * чат не открывается, прочитанным ничего не отмечается, в память Web K
@@ -860,6 +923,9 @@ async function handle(ask: any) {
 
     case 'texts':
       return textsOf(String(ask.chatId).toPeerId(), (ask.ids ?? []).map(Number).filter(Number.isInteger));
+
+    case 'keys':
+      return keysOf(String(ask.chatId).toPeerId(), (ask.ids ?? []).map(Number).filter(Number.isInteger));
 
     case 'dialogTop':
       /*
