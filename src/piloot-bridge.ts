@@ -729,6 +729,43 @@ async function voiceOf(peerId: PeerId, mid: number): Promise<string | null> {
   return url ? asDataUrl(url) : null;
 }
 
+/**
+ * Расшифровка голосового или кружка (217) — тем же, чем Web K
+ * расшифровывает сам. Ответ бывает сразу, а бывает «пока думаю» и потом
+ * весть `message_transcribed`: ждем ее до 20 секунд. Отказ (квота без
+ * Premium, не вышло) — пусто. Ничего не отправляется.
+ */
+async function transcriptOf(peerId: PeerId, mid: number): Promise<string | null> {
+  const {rootScope} = await web();
+  const manager = rootScope.managers.appMessagesManager;
+  const message: any = await manager.getMessageByPeer(peerId, mid);
+  const type = message?.media?.document?.type;
+  if(!message || (type !== 'voice' && type !== 'round')) return null;
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (text: unknown) => {
+      if(done) return;
+      done = true;
+      clearTimeout(timer);
+      rootScope.removeEventListener('message_transcribed', listen);
+      resolve(typeof text === 'string' && text.trim() !== '' ? text.trim().slice(0, 4096) : null);
+    };
+    const listen = (event: {peerId: PeerId, mid: number, text: string, pending?: boolean}) => {
+      if(event.peerId === peerId && event.mid === mid && !event.pending) finish(event.text);
+    };
+    const timer = setTimeout(() => finish(null), 20_000);
+
+    rootScope.addEventListener('message_transcribed', listen);
+    manager.transcribeAudio(message).then(
+      (result: any) => {
+        if(!result?.pFlags?.pending) finish(result?.text);
+      },
+      () => finish(null)
+    );
+  });
+}
+
 /*
  * ── Обои ──────────────────────────────────────────────────────────────
  *
@@ -949,6 +986,9 @@ async function handle(ask: any) {
 
     case 'voice':
       return voiceOf(ask.chatId.toPeerId(), Number(ask.messageId));
+
+    case 'transcribe':
+      return transcriptOf(ask.chatId.toPeerId(), Number(ask.messageId));
 
     case 'show': {
       // Открыть чат на нужном сообщении.
